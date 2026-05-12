@@ -738,11 +738,7 @@ if "debug_logs" not in st.session_state:
 
 
 # --- 4. UI Configuration ---
-<<<<<<< HEAD
 st.set_page_config(page_title="CRP HEL and Wetland Screening Tool (Prototype)", layout="wide")
-=======
-st.set_page_config(page_title="CRP HEL Screening & CP Recommendation Tool", layout="wide")
->>>>>>> a096d349b591f83bee0c179966ca55fc57500073
 
 st.markdown("""
     <style>
@@ -774,11 +770,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-<<<<<<< HEAD
 st.title("🛡️ CRP HEL and Wetland Screening Tool (Prototype)")
-=======
-st.title("🛡️ CRP HEL Screening & CP Recommendation Tool")
->>>>>>> a096d349b591f83bee0c179966ca55fc57500073
 
 # --- 5. Sidebar ---
 with st.sidebar:
