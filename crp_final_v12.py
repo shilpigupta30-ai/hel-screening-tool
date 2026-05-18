@@ -833,9 +833,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Debug Mode ───────────────────────────────────────────────────────
-    debug_mode = st.checkbox("🐛 Enable NOAA Debug Logging", value=False)
-
     st.divider()
 
     # ── Precision Entry ──────────────────────────────────────────────────
@@ -872,11 +869,11 @@ with st.sidebar:
             st.session_state["last_wkt"]          = normalized  # FIXED: sync state
             st.session_state["is_loading"]        = True
             st.session_state["last_request_time"] = time.time()
-            noaa_r, noaa_label = get_noaa_r_factor(center_lat, center_lon, debug=debug_mode)
+            noaa_r, noaa_label = get_noaa_r_factor(center_lat, center_lon, debug=False)
             if noaa_r:
                 st.session_state["detected_r"] = (noaa_r, noaa_label, "NOAA CDO")
             else:
-                st.session_state["detected_r"] = get_state_r_factor(center_lat, center_lon, debug=debug_mode)
+                st.session_state["detected_r"] = get_state_r_factor(center_lat, center_lon, debug=False)
 
             with st.spinner("Fetching soil data from USDA..."):
                 st.session_state["analysis_results"] = fetch_nrcs_data(wkt)
@@ -982,12 +979,12 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         c = canvas.Canvas(pdf_buffer, pagesize=letter)
         width, height = letter
 
-        # Margins
-        margin_left = 0.5 * inch
-        margin_right = 0.5 * inch
-        margin_top = 0.5 * inch
+        # Margins - increased for better whitespace
+        margin_left = 0.6 * inch
+        margin_right = 0.6 * inch
+        margin_top = 0.6 * inch
         current_y = height - margin_top
-        line_height = 0.12 * inch
+        line_height = 0.14 * inch  # Increased for more breathing room
 
         # ═══════════════════════════════════════════════════════════
         # FORM HEADER
@@ -1026,7 +1023,7 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
             c.drawString(margin_left + 1.5*inch, current_y, blank)
             current_y -= line_height * 1.1
 
-        current_y -= line_height * 0.5
+        current_y -= line_height * 1.2  # Increased spacing before next section
 
         # ═══════════════════════════════════════════════════════════
         # SECTION B: HIGHLY ERODIBLE LAND (HEL) DETERMINATION
@@ -1053,38 +1050,38 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         ls_display = f"{ls_factor:.3f}" if ls_factor else "Approximated"
 
         # Format R-Factor - parameter on line 1, source on line 2
-        c.setFont("Helvetica", 9)
+        c.setFont("Helvetica", 10)
         c.drawString(margin_left + 0.3*inch, current_y, f"R-Factor (Rainfall): {r_val:.1f}")
-        current_y -= line_height * 0.75
-        c.setFont("Helvetica", 8)
+        current_y -= line_height * 0.85
+        c.setFont("Helvetica", 9)  # Increased from 8 to 9
         c.drawString(margin_left + 0.5*inch, current_y, f"Source: {state_label}")
-        current_y -= line_height * 1.2
+        current_y -= line_height * 1.6  # Increased spacing between parameters
 
         # Format K-Factor - parameter on line 1, range on line 2
-        c.setFont("Helvetica", 9)
+        c.setFont("Helvetica", 10)
         c.drawString(margin_left + 0.3*inch, current_y, f"K-Factor (Soil): {k_avg:.4f}")
-        current_y -= line_height * 0.75
-        c.setFont("Helvetica", 8)
+        current_y -= line_height * 0.85
+        c.setFont("Helvetica", 9)  # Increased from 8 to 9
         c.drawString(margin_left + 0.5*inch, current_y, f"Range: {k_min:.4f}–{k_max:.4f}")
-        current_y -= line_height * 1.2
+        current_y -= line_height * 1.6  # Increased spacing between parameters
 
         # Format LS-Factor - parameter on line 1, source on line 2
-        c.setFont("Helvetica", 9)
+        c.setFont("Helvetica", 10)
         c.drawString(margin_left + 0.3*inch, current_y, f"LS-Factor (Slope): {ls_display}")
-        current_y -= line_height * 0.75
-        c.setFont("Helvetica", 8)
+        current_y -= line_height * 0.85
+        c.setFont("Helvetica", 9)  # Increased from 8 to 9
         c.drawString(margin_left + 0.5*inch, current_y, f"Source: {ls_source}")
-        current_y -= line_height * 1.2
+        current_y -= line_height * 1.6  # Increased spacing between parameters
 
         # Format T-Factor - parameter on line 1, range on line 2
-        c.setFont("Helvetica", 9)
+        c.setFont("Helvetica", 10)
         c.drawString(margin_left + 0.3*inch, current_y, f"T-Factor (Tolerance): {t_avg:.2f} t/ac/yr")
-        current_y -= line_height * 0.75
-        c.setFont("Helvetica", 8)
+        current_y -= line_height * 0.85
+        c.setFont("Helvetica", 9)  # Increased from 8 to 9
         c.drawString(margin_left + 0.5*inch, current_y, f"Range: {t_min:.2f}–{t_max:.2f}")
-        current_y -= line_height * 1.3
+        current_y -= line_height * 1.8  # Extra space before EI result
 
-        current_y -= line_height * 0.5
+        current_y -= line_height * 0.3
 
         # Determination Result
         c.setFont("Helvetica-Bold", 10)
@@ -1094,7 +1091,7 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         c.setFont("Helvetica", 8)
         current_y -= line_height
         c.drawString(margin_left + 0.5*inch, current_y, f"(Range: {ei_min:.2f}–{ei_max:.2f})")
-        current_y -= line_height * 1.5
+        current_y -= line_height * 2.0  # Increased spacing before next section
 
         # ═══════════════════════════════════════════════════════════
         # SECTION C: FIELD DETERMINATION TABLE
@@ -1117,7 +1114,7 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         c.line(margin_left + 0.1*inch, current_y + line_height*0.2, width - margin_right, current_y + line_height*0.2)
         current_y -= line_height * 0.3
 
-        # Table rows (one per soil component)
+        # Table rows (one per soil component) - increased row height for readability
         c.setFont("Helvetica", 8)
         for idx, row in df.iterrows():
             soil_type = str(row.get("Soil Type", "Field"))[:20]
@@ -1133,9 +1130,9 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
             c.drawString(col_x[3], current_y, acres)
             c.drawString(col_x[4], current_y, det_date)
             c.drawString(col_x[5], current_y, sodbust)
-            current_y -= line_height
+            current_y -= line_height * 1.2  # Increased from 1.0 for better spacing
 
-        current_y -= line_height
+        current_y -= line_height * 1.2  # Increased spacing before next section
 
         # ═══════════════════════════════════════════════════════════
         # SECTION D: CERTIFICATIONS (NRCS Staff use)
@@ -1811,11 +1808,11 @@ with col_map:
             st.session_state["center_lon"]        = c_lon
             # Store bounds for wetland assessment (drawn polygon bounds)
             st.session_state["drawn_bounds"]      = [min(lats), min(lons), max(lats), max(lons)]
-            noaa_r, noaa_label = get_noaa_r_factor(c_lat, c_lon, debug=debug_mode)
+            noaa_r, noaa_label = get_noaa_r_factor(c_lat, c_lon)
             if noaa_r:
                 st.session_state["detected_r"] = (noaa_r, noaa_label, "NOAA CDO")
             else:
-                st.session_state["detected_r"] = get_state_r_factor(c_lat, c_lon, debug=debug_mode)
+                st.session_state["detected_r"] = get_state_r_factor(c_lat, c_lon)
 
             _, state_label, _ = st.session_state["detected_r"]
             with st.spinner(f"Fetching soil data ({state_label})..."):
@@ -1909,19 +1906,6 @@ with col_res:
 
         # LS factor display (will be populated after soil data analysis)
         ls_display_placeholder = st.empty()
-
-    # Debug info (if debug mode enabled)
-    if debug_mode:
-        with st.expander("🐛 NOAA Debug Info", expanded=True):
-            st.write(f"**R-Factor Source:** {state_label}")
-            st.write(f"**Value:** {r_val}")
-
-            if st.session_state.get("debug_logs"):
-                st.write("**API Call Log:**")
-                for log in st.session_state["debug_logs"]:
-                    st.write(log)
-            else:
-                st.info("No debug logs yet. Run an analysis to see NOAA API details.")
 
     if st.session_state["analysis_results"]:
         res = st.session_state["analysis_results"]
@@ -2125,7 +2109,7 @@ with col_res:
                         bounds = [bounds_list[0][0], bounds_list[0][1], bounds_list[1][0], bounds_list[1][1]]
 
                 # DEBUG: Only show debug info if debug mode enabled
-                if debug_mode:
+                if False:
                     with st.expander("🔍 Wetland Assessment Debug Info"):
                         st.write(f"**WETLAND_FEATURES_AVAILABLE:** {WETLAND_FEATURES_AVAILABLE}")
                         st.write(f"**bounds extracted:** {bounds is not None}")
