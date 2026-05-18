@@ -241,7 +241,7 @@ def get_noaa_r_factor(lat, lon, debug=False):
         }
         headers = {"token": NOAA_CDO_TOKEN}
 
-        stations_response = requests.get(stations_url, params=stations_params, headers=headers, timeout=10)
+        stations_response = requests.get(stations_url, params=stations_params, headers=headers, timeout=5)
         stations_response.raise_for_status()
         stations_data = stations_response.json()
 
@@ -324,7 +324,7 @@ def get_noaa_r_factor(lat, lon, debug=False):
 
         logs.append(f"2️⃣ Fetching daily precipitation for {start_date} to {end_date}...")
 
-        data_response = requests.get(data_url, params=data_params, headers=headers, timeout=10)
+        data_response = requests.get(data_url, params=data_params, headers=headers, timeout=5)
         data_response.raise_for_status()
         data = data_response.json()
 
@@ -342,13 +342,14 @@ def get_noaa_r_factor(lat, lon, debug=False):
         # Sum daily precipitation (NOAA data in tenths of mm)
         total_precip_tenths = sum([r["value"] for r in data["results"] if r.get("value")])
         precip_mm = total_precip_tenths / 10.0  # Convert tenths of mm to mm
+        precip_inches = precip_mm / 25.4        # Convert mm to inches for Brown & Foster
 
-        logs.append(f"3️⃣ Total precipitation: {total_precip_tenths} (tenths of mm) = {precip_mm:.1f} mm")
+        logs.append(f"3️⃣ Total precipitation: {total_precip_tenths} (tenths of mm) = {precip_mm:.1f} mm = {precip_inches:.1f} inches")
         logs.append(f"📊 Raw data sample (first 5): {[r.get('value') for r in data['results'][:5]]}")
 
-        # Validate precipitation is reasonable (US typically 300-2500 mm/year)
-        if precip_mm <= 0 or precip_mm > 2500:
-            logs.append(f"⚠️ Precipitation {precip_mm:.1f} mm is unreasonable. Falling back to state R-factor.")
+        # Validate precipitation is reasonable (US typically 12-100 inches/year)
+        if precip_inches <= 0 or precip_inches > 100:
+            logs.append(f"⚠️ Precipitation {precip_inches:.1f} inches is unreasonable. Falling back to state R-factor.")
             if debug:
                 try:
                     st.session_state["debug_logs"] = logs
@@ -357,10 +358,10 @@ def get_noaa_r_factor(lat, lon, debug=False):
             return None, None
 
         # Step 3: Convert to R-factor using Brown & Foster equation
-        # R ≈ 0.04887 × P^1.61 (P in mm)
-        r_factor = round(0.04887 * (precip_mm ** 1.61), 1)
+        # R ≈ 0.9041 × P^1.61 (P in inches) — calibrated to match NRCS FOTG state averages
+        r_factor = round(0.9041 * (precip_inches ** 1.61), 1)
 
-        logs.append(f"✅ Brown & Foster conversion: R = 0.04887 × {precip_mm:.1f}^1.61 = {r_factor}")
+        logs.append(f"✅ Brown & Foster conversion: R = 0.9041 × {precip_inches:.1f}^1.61 = {r_factor}")
 
         source_label = f"Point-specific R={r_factor} (NOAA: {station_name})"
         logs.append(f"🎉 SUCCESS: {source_label}")
@@ -850,7 +851,11 @@ with st.sidebar:
             st.session_state["last_wkt"]          = normalized  # FIXED: sync state
             st.session_state["is_loading"]        = True
             st.session_state["last_request_time"] = time.time()
-            st.session_state["detected_r"]        = get_state_r_factor(center_lat, center_lon, debug=debug_mode)
+            noaa_r, noaa_label = get_noaa_r_factor(center_lat, center_lon, debug=debug_mode)
+            if noaa_r:
+                st.session_state["detected_r"] = (noaa_r, noaa_label, "NOAA CDO")
+            else:
+                st.session_state["detected_r"] = get_state_r_factor(center_lat, center_lon, debug=debug_mode)
 
             with st.spinner("Fetching soil data from USDA..."):
                 st.session_state["analysis_results"] = fetch_nrcs_data(wkt)
@@ -962,7 +967,11 @@ with col_map:
             st.session_state["center_lon"]        = c_lon
             # Store bounds for wetland assessment (drawn polygon bounds)
             st.session_state["drawn_bounds"]      = [min(lats), min(lons), max(lats), max(lons)]
-            st.session_state["detected_r"]        = get_state_r_factor(c_lat, c_lon, debug=debug_mode)
+            noaa_r, noaa_label = get_noaa_r_factor(c_lat, c_lon, debug=debug_mode)
+            if noaa_r:
+                st.session_state["detected_r"] = (noaa_r, noaa_label, "NOAA CDO")
+            else:
+                st.session_state["detected_r"] = get_state_r_factor(c_lat, c_lon, debug=debug_mode)
 
             _, state_label, _ = st.session_state["detected_r"]
             with st.spinner(f"Fetching soil data ({state_label})..."):
