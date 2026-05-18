@@ -1544,27 +1544,40 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
             st.markdown("---")
             st.subheader("📊 Live Comparison")
 
-            col1, col2, col3 = st.columns(3)
+            # LS-Factor Comparison (2 columns for better readability)
+            st.markdown("**LS-Factor (Slope Length × Slope Steepness):**")
+            col1, col2 = st.columns(2)
             with col1:
-                st.metric("Field-Measured LS", f"{field_ls:.3f}", "from your data")
+                st.metric("Field-Measured LS", f"{field_ls:.3f}", "from your input data")
             with col2:
-                st.metric("Automated LS", f"{ls_factor:.3f}" if ls_factor else "approx", ls_source)
-            with col3:
-                ls_diff = field_ls - (ls_factor if ls_factor else 0)
-                pct_diff = (ls_diff/(ls_factor if ls_factor else 1)*100) if ls_factor else 0
-                st.metric("LS Difference", f"{ls_diff:.3f}", f"{pct_diff:.1f}%")
+                ls_display = f"{ls_factor:.3f}" if ls_factor else "approximated"
+                st.metric("Automated LS (DEM)", ls_display, ls_source)
+
+            # LS Difference
+            ls_diff = field_ls - (ls_factor if ls_factor else 0)
+            pct_diff = (ls_diff/(ls_factor if ls_factor else 1)*100) if ls_factor else 0
+            st.info(f"**Difference:** {ls_diff:+.3f} ({pct_diff:+.1f}%) — {'Field steeper' if ls_diff > 0 else 'DEM steeper' if ls_diff < 0 else 'Match'}")
 
             st.markdown("---")
-            col1, col2, col3 = st.columns(3)
+
+            # EI Comparison (2 columns for better readability)
+            st.markdown("**Erosion Index (EI) — HEL Determination:**")
+            col1, col2 = st.columns(2)
             with col1:
-                st.metric("Field-Based EI", f"{field_ei_max:.1f}", "✅ HEL" if field_ei_max >= 8.0 else "❌ Not HEL")
+                hel_field = "✅ HEL" if field_ei_max >= 8.0 else "❌ NOT HEL"
+                st.metric("Field-Based EI", f"{field_ei_max:.1f}", hel_field)
             with col2:
-                st.metric("Automated EI", f"{automated_ei_max:.1f}" if automated_ei_max else "N/A", "✅ HEL" if (automated_ei_max and automated_ei_max >= 8.0) else "❌ Not HEL")
-            with col3:
                 if automated_ei_max:
-                    ei_diff = field_ei_max - automated_ei_max
-                    direction = "↑ Higher" if ei_diff > 0 else "↓ Lower" if ei_diff < 0 else "="
-                    st.metric("EI Impact", f"{abs(ei_diff):.1f}", direction)
+                    hel_auto = "✅ HEL" if automated_ei_max >= 8.0 else "❌ NOT HEL"
+                    st.metric("Automated EI (DEM)", f"{automated_ei_max:.1f}", hel_auto)
+                else:
+                    st.metric("Automated EI (DEM)", "N/A", "—")
+
+            # EI Impact
+            if automated_ei_max:
+                ei_diff = field_ei_max - automated_ei_max
+                direction = "↑ Field Higher" if ei_diff > 0.5 else "↓ DEM Higher" if ei_diff < -0.5 else "≈ Similar"
+                st.info(f"**EI Difference:** {ei_diff:+.1f} points — {direction}")
 
             st.info(
                 "💡 **Field verification tip:** If field-based EI differs significantly from automated, "
@@ -1617,14 +1630,15 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
 
             # EI Summary
             st.markdown("**Erosion Index (EI) Result:**")
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             with col1:
                 st.metric("Maximum EI", f"{ei_max:.2f}", "Highest soil type")
             with col2:
                 st.metric("Minimum EI", f"{ei_min:.2f}", "Lowest soil type")
-            with col3:
-                hel_status = "✅ HEL" if ei_max >= 8.0 else "❌ NOT HEL"
-                st.metric("HEL Status", hel_status, "7 CFR § 12.21")
+
+            hel_status = "✅ HEL" if ei_max >= 8.0 else "❌ NOT HEL"
+            status_color = "error" if ei_max >= 8.0 else "success"
+            st.metric("🔍 HEL Determination", hel_status, "Per 7 CFR § 12.21")
 
             st.markdown("---")
 
@@ -1687,15 +1701,13 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
 
         # Section 1: RUSLE2 Parameters with Sources
         st.markdown("**📊 RUSLE2 Calculation Parameters**")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric("R-Factor", r_val, state_label)
+            st.metric("R-Factor (Rainfall)", r_val, state_label)
+            st.metric("LS Factor (Slope)", f"{ls_factor:.3f}" if ls_factor else "Approx.", ls_source)
         with col2:
-            st.metric("K-Factor (Avg)", f"{df['K-Fact'].mean():.3f}", "SSURGO")
-        with col3:
-            st.metric("LS Factor", f"{ls_factor:.3f}" if ls_factor else "approx.", ls_source)
-        with col4:
-            st.metric("T-Factor (Avg)", f"{df['T-Fact'].mean():.2f}", "SSURGO")
+            st.metric("K-Factor (Soil Avg)", f"{df['K-Fact'].mean():.3f}", "SSURGO")
+            st.metric("T-Factor (Tolerance Avg)", f"{df['T-Fact'].mean():.2f}", "SSURGO")
 
         st.markdown("---")
 
