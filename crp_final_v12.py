@@ -23,6 +23,7 @@ try:
     from wetland_features import (
         get_nlcd_vegetation_type,
         get_nhd_proximity,
+        get_ssurgo_water_table,
         detect_wetland_hydrology_from_ssurgo,
         combine_wetland_indicators
     )
@@ -577,6 +578,15 @@ def fetch_nrcs_data(wkt):
     try:
         response = requests.post(url, data=payload, timeout=60)
         response.raise_for_status()
+
+        # Check if response is HTML (maintenance, error page, etc.)
+        if response.text.strip().startswith("<"):
+            # Extract maintenance message if present
+            if "maintenance" in response.text.lower():
+                return {"error": "🔧 NRCS Soil Data Access is under scheduled maintenance. Please try again in a few minutes (maintenance window: 12:30-12:45 AM CST daily)."}
+            else:
+                return {"error": f"USDA API returned error page. Response: {response.text[:300]}"}
+
         data = response.json()
         if not isinstance(data, dict):
             return {"error": "Unexpected API response format"}
@@ -790,11 +800,11 @@ with st.sidebar:
     conservationist_mode = st.checkbox(
         "🔐 NRCS Conservationist Mode",
         value=False,
-        help="Enable advanced features: field verification, AD1026 pre-fill, technical details"
+        help="Enable advanced features: field verification, NRCS-CPA-026 pre-fill, technical details"
     )
 
     if conservationist_mode:
-        st.info("👨‍🌾 **Conservationist Workspace Enabled**\n\nYou now have access to:\n- Field data input\n- AD1026 pre-fill\n- Technical details\n- Export options")
+        st.info("👨‍🌾 **Conservationist Workspace Enabled**\n\nYou now have access to:\n- Field data input\n- NRCS-CPA-026 pre-fill\n- Technical details\n- Export options")
     else:
         st.info("👨‍🚜 **Farmer-Friendly Mode**\n\nSimple results with next steps.\nCall NRCS for official determination.")
 
@@ -952,7 +962,7 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
     Generate PDF with pre-filled NRCS-CPA-026 form data.
 
     Form: NRCS-CPA-026 "Highly Erodible Land and Wetland Conservation Determination"
-    This is the official NRCS form for documenting HEL determinations (not the AD-1026 FSA form).
+    This is the official NRCS form for documenting HEL determinations with RUSLE2 parameters.
 
     Args:
         r_val: R-factor value
@@ -1309,16 +1319,47 @@ def show_farmer_view(analysis_results, r_val, state_label, ls_factor=None, ls_so
 
         st.markdown("---")
 
-        # Wetland Status
+        # Wetland Status - flag potential indicators, not definitive determination
+        st.markdown("**💧 Wetland Indicator Checklist:**")
+
+        # Build simple wetland indicators table for farmer view using actual assessment data
         hydric_detected = (df["Hydric"] == "Yes").any()
+
+        # Check if detailed wetland assessment is available
+        assessment = st.session_state.get("wetland_assessment")
+
+        if assessment:
+            # Use actual detected indicators
+            wetland_indicators = {
+                "Hydric Soils": "✅ Yes" if assessment["indicators"]["hydric_soils"] else "❌ No",
+                "Wetland Vegetation": "✅ Yes" if assessment["indicators"]["wetland_vegetation"] else "❌ No",
+                "High Water Table": "✅ Yes" if assessment["indicators"]["hydrology_ssurgo"] else "❌ No",
+                "Water Body Nearby": "✅ Yes" if assessment["indicators"]["hydrology_nhd"] else "❌ No"
+            }
+        else:
+            # Fallback if detailed assessment not available
+            wetland_indicators = {
+                "Hydric Soils": "✅ Yes" if hydric_detected else "❌ No",
+                "Wetland Vegetation": "⚠️ Not assessed",
+                "High Water Table": "⚠️ Not assessed",
+                "Water Body Nearby": "⚠️ Not assessed"
+            }
+
+        wetland_df = pd.DataFrame(list(wetland_indicators.items()), columns=["Indicator", "Status"])
+        st.dataframe(wetland_df, use_container_width=True, hide_index=True)
+
         if hydric_detected:
             st.markdown(
                 '<div style="background:#E1F5FE;border-left:4px solid #0277BD;padding:15px;border-radius:4px;margin-bottom:15px;">'
-                '<h3 style="color:#0277BD;margin:0;">💧 Wetland Soils Detected</h3>'
-                '<p style="margin:10px 0 0 0;color:#333;">Your field has hydric soils, which may be eligible for wetland restoration practices.</p>'
+                '<h3 style="color:#0277BD;margin:0;">💧 Potential Wetland Indicator Detected</h3>'
+                '<p style="margin:10px 0 0 0;color:#333;">Your field contains hydric soils (wetland-forming soils). '
+                '<strong>NRCS field verification is required</strong> to make an official wetland determination. '
+                'Contact your local NRCS office to schedule a wetland delineation.</p>'
                 '</div>',
                 unsafe_allow_html=True
             )
+        else:
+            st.info("ℹ️ No hydric soils detected in SSURGO database. However, a site visit may reveal other wetland indicators.")
 
     # Next Steps
     st.markdown(
@@ -1352,7 +1393,7 @@ def show_farmer_view(analysis_results, r_val, state_label, ls_factor=None, ls_so
 
 def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=None, ls_source=None, df=None):
     """
-    Display conservationist-focused results: Technical details + Field verification + AD1026
+    Display conservationist-focused results: Technical details + Field verification + NRCS-CPA-026 form
 
     Args:
         analysis_results: SSURGO soil analysis results
@@ -1364,7 +1405,7 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
     """
     # Create tabs for different sections
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📊 Results", "🔧 Field Verification", "📋 Components", "📄 AD1026", "⚙️ Technical"]
+        ["📊 Results", "🔧 Field Verification", "📋 Components", "📄 NRCS-CPA-026 Form", "⚙️ Technical"]
     )
 
     with tab1:
@@ -1607,7 +1648,7 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
 
     with tab4:
         st.subheader("📋 NRCS-CPA-026 Form (Pre-filled)")
-        st.info("✅ **Download pre-filled NRCS-CPA-026** form with tool-calculated RUSLE2 parameters. This is the NRCS HEL determination form (not the FSA AD-1026 certification form).")
+        st.info("✅ **Download pre-filled NRCS-CPA-026** form with tool-calculated RUSLE2 parameters. This official NRCS form documents HEL determinations and is ready for conservationist field verification and signature.")
 
         if df is not None and not df.empty:
             # Display form data preview
@@ -1678,8 +1719,8 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
             # Form information
             st.markdown("**📋 About This Form:**")
             st.markdown("""
-            - **NRCS-CPA-026:** Official NRCS form for documenting HEL/Wetland determinations
-            - **Purpose:** Used by NRCS to document findings; producer files AD-1026 (FSA) separately
+            - **NRCS-CPA-026:** Official NRCS form for documenting HEL/Wetland determinations with RUSLE2 analysis
+            - **Purpose:** Used by NRCS conservationists to document technical findings and determinations
             - **Status:** This PDF is pre-filled with screening calculations (NOT official until NRCS signs)
             - **Next Step:** Bring this to your local NRCS office for field verification and official signature
             """)
@@ -1834,21 +1875,21 @@ with col_res:
                 '''
                 <div style="background:#E8F5E9;border-left:4px solid #388E3C;padding:20px;border-radius:8px;margin-bottom:20px;">
                 <h3 style="color:#2E7D32;margin-top:0;">👨‍🌾 Conservationist Workspace</h3>
-                <p style="color:#333;margin:10px 0;">Verify field data, generate AD1026 forms, and access technical RUSLE2 parameters.</p>
+                <p style="color:#333;margin:10px 0;">Verify field data, generate NRCS-CPA-026 forms, and access technical RUSLE2 parameters.</p>
 
                 <h4 style="color:#2E7D32;">📋 Workflow:</h4>
                 <ol style="color:#333;margin-left:20px;">
                     <li><strong>Draw Polygon or Enter Coordinates</strong> — Define field boundary (⚡ polygon auto-analyzes)</li>
                     <li><strong>View Results Tab</strong> — Check automated HEL status and EI metrics</li>
                     <li><strong>Field Verification Tab</strong> — Enter measured slope length & steepness from site visit</li>
-                    <li><strong>AD1026 Tab</strong> — Download pre-filled form for FSA submission</li>
+                    <li><strong>NRCS-CPA-026 Form Tab</strong> — Download pre-filled HEL determination form</li>
                     <li><strong>Technical Tab</strong> — Review R, K, LS, T factors and uncertainty flags</li>
                 </ol>
 
                 <h4 style="color:#2E7D32;">🔍 Key Features:</h4>
                 <ul style="color:#333;margin-left:20px;">
                     <li><strong>Field Data Override</strong> — Compare automated vs. measured slopes</li>
-                    <li><strong>Form Integration</strong> — AD1026 pre-fill reduces paperwork by 30+ min</li>
+                    <li><strong>Form Integration</strong> — NRCS-CPA-026 pre-fill with RUSLE2 data reduces paperwork by 30+ min</li>
                     <li><strong>RUSLE2 Transparency</strong> — See all calculation parameters and sources</li>
                 </ul>
                 </div>
@@ -2148,18 +2189,17 @@ with col_res:
                         st.session_state["debug_logs"].append(f"Dominant drainage: {dominant_drainage}")
                         st.session_state["debug_logs"].append(f"Has poor drainage component: {has_poor_drainage_component}")
 
-                        # Water table: fetch from comonth table (seasonal representative depth in cm)
-                        # For now, we'll leave as None since comonth joins require different SDA syntax
-                        # TODO: Implement comonth query once we verify SDA syntax for month-based water table data
+                        # Water table: estimate from drainage class (proxy method)
+                        # Note: Direct comonth queries pending NRCS API stability; using drainage class correlation
                         watertab_depth = None
                         try:
-                            # NOTE: This approach may require different SDA endpoint or syntax
-                            # comonth table has watertab_r (representative water table depth)
-                            # but joining to components has proven problematic with SDA API
-                            # Keeping as None for stability; can be enhanced later
-                            pass
-                        except Exception:
-                            watertab_depth = None
+                            watertab_depth = get_ssurgo_water_table(polygon_center_lat, polygon_center_lon, drainage_class=dominant_drainage)
+                            if watertab_depth:
+                                st.session_state["debug_logs"].append(f"✅ Water table estimate: {watertab_depth:.1f} cm (from drainage class: {dominant_drainage})")
+                            else:
+                                st.session_state["debug_logs"].append(f"⚠️ Water table: drainage class {dominant_drainage} indicates well-drained (no wetland hydrology)")
+                        except Exception as wt_err:
+                            st.session_state["debug_logs"].append(f"⚠️ Water table estimation failed: {wt_err}")
 
                         # Fetch NLCD vegetation with error logging
                         vegetation = None
@@ -2270,24 +2310,80 @@ with col_res:
                         f'<div style="background-color:{bg_color};border-left:5px solid {border_color};'
                         f'padding:10px;border-radius:5px;margin-bottom:10px;'
                         f'font-size:11px;color:#BAE6FD;line-height:1.4;">'
-                        f'<b>{emoji} {assessment["wetland_type"]}</b><br>'
-                        f'<i>Confidence: {assessment["confidence"]}</i><br><br>'
+                        f'<b>{emoji} Potential Wetland Indicators Detected</b><br>'
+                        f'<i>Indicator Strength: {assessment["confidence"]}</i><br><br>'
                         f'{indicators_display}'
-                        f'<b>Recommendation:</b> {assessment["recommendation"]}'
+                        f'<b>Next Step:</b> Contact your local NRCS office for official wetland determination. '
+                        f'An NRCS conservationist will conduct a field visit to verify wetland status per Federal Interagency Delineation Manual standards.'
                         f'</div>',
                         unsafe_allow_html=True
                     )
 
+                    # Add detailed wetland indicators table for conservationists
+                    st.markdown("**📊 Detailed Wetland Indicators Assessment:**")
+
+                    # Build detailed evidence for each indicator
+                    veg_evidence = "—"
+                    if vegetation and assessment["indicators"]["wetland_vegetation"]:
+                        nlcd_class = vegetation.get("nlcd_class", "N/A")
+                        veg_type = vegetation.get("vegetation_type", "Wetland vegetation")
+                        veg_evidence = f"NLCD Class {nlcd_class}: {veg_type}"
+
+                    hydrology_nhd_evidence = "—"
+                    if nhd_proximity and assessment["indicators"]["hydrology_nhd"]:
+                        wetland_type = nhd_proximity.get("wetland_type", "Water body")
+                        nwi_attr = nhd_proximity.get("nwi_attribute", "")
+                        signal = nhd_proximity.get("hydrology_signal", "")
+                        hydrology_nhd_evidence = f"{wetland_type} (NWI: {nwi_attr}) - {signal} signal"
+
+                    wetland_table_data = [
+                        {
+                            "Indicator": "Hydric Soils",
+                            "Detected": "✅ Yes" if assessment["indicators"]["hydric_soils"] else "❌ No",
+                            "Evidence": "SSURGO hydricrating indicates wetland-forming soils (hydric rating present)",
+                            "Confidence": "High" if assessment["indicators"]["hydric_soils"] else "—"
+                        },
+                        {
+                            "Indicator": "Hydrophytic Vegetation",
+                            "Detected": "✅ Yes" if assessment["indicators"]["wetland_vegetation"] else "❌ No",
+                            "Evidence": veg_evidence,
+                            "Confidence": "High" if assessment["indicators"]["wetland_vegetation"] else "—"
+                        },
+                        {
+                            "Indicator": "Wetland Hydrology (Water Table)",
+                            "Detected": "✅ Yes" if assessment["indicators"]["hydrology_ssurgo"] else "❌ No",
+                            "Evidence": "SSURGO drainage class indicates poorly drained soils (≤30cm water table)",
+                            "Confidence": "High" if assessment["indicators"]["hydrology_ssurgo"] else "—"
+                        },
+                        {
+                            "Indicator": "Proximity to Water Body",
+                            "Detected": "✅ Yes" if assessment["indicators"]["hydrology_nhd"] else "❌ No",
+                            "Evidence": hydrology_nhd_evidence if hydrology_nhd_evidence != "—" else "NHD/NWI database shows no mapped wetland within 5km",
+                            "Confidence": "High" if assessment["indicators"]["hydrology_nhd"] else "—"
+                        }
+                    ]
+
+                    wetland_table_df = pd.DataFrame(wetland_table_data)
+                    st.dataframe(wetland_table_df, use_container_width=True, hide_index=True)
+
+                    st.info(
+                        "📋 **For Official Determination:**\n\n"
+                        "Per Federal Interagency Wetlands Delineation Manual, official determination requires:\n"
+                        "1. All three primary indicators (hydric soils, hydrophytic vegetation, wetland hydrology) OR\n"
+                        "2. Two primary indicators in certain combinations\n\n"
+                        "Schedule NRCS field visit to verify indicators and document findings."
+                    )
+
                 elif has_hydric:
-                    # Fallback to original simple hydric indicator if wetland features unavailable
+                    # Fallback to simple hydric indicator if detailed wetland features unavailable
                     st.markdown(
                         f'<div style="background-color:#0d3349;border-left:5px solid #38BDF8;'
                         f'padding:10px;border-radius:5px;margin-bottom:10px;'
                         f'font-size:11px;color:#BAE6FD;line-height:1.4;">'
-                        f'<b>💧 Wetland Soils Detected</b><br>'
+                        f'<b>💧 Potential Wetland Indicator: Hydric Soils</b><br>'
                         f'{hydric_pct}% of soil components classified as hydric (SSURGO). '
-                        f'Wetland practices CP23, CP27/CP28 may be applicable — '
-                        f'confirm with NRCS wetland determination.'
+                        f'This indicator suggests potential wetland. '
+                        f'Contact your local NRCS office for official wetland determination and field verification.'
                         f'</div>',
                         unsafe_allow_html=True
                     )
