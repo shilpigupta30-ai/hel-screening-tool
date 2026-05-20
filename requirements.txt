@@ -7,3 +7,5 @@ numpy>=1.24.0
 scipy>=1.10.0
 py3dep>=0.16.0
 reportlab>=4.0.0
+rasterio>=1.3.0
+pyproj>=3.4.0
