@@ -3,6 +3,12 @@
 Wetland Feature Detection for CRP HEL Tool
 - Hydrophytic Vegetation: NLCD land cover classification
 - Wetland Hydrology: SSURGO water table + NHD proximity
+
+Changelog:
+  v2.0 (2026-05-19): Upgraded NLCD 2019 → NLCD 2021
+    - Updated MRLC WMS endpoint to NLCD_2021_Land_Cover_L48
+    - NLCD 2021 improves wetland class accuracy (classes 90, 95)
+    - Reflects land cover changes through 2021 vs 2019 vintage
 """
 
 import requests
@@ -32,31 +38,39 @@ NLCD_ALL_CLASSES = {
     90: "Woody Wetlands", 95: "Emergent Herbaceous Wetlands"
 }
 
+# ── NLCD Version Config ───────────────────────────────────────────────────────
+# To upgrade NLCD year in future: update NLCD_YEAR and NLCD_LAYER_NAME below.
+# Check available layers at: https://www.mrlc.gov/geoserver/mrlc_display/wms?SERVICE=WMS&REQUEST=GetCapabilities
+NLCD_YEAR = "2021"
+NLCD_LAYER_NAME = f"NLCD_{NLCD_YEAR}_Land_Cover_L48"
+NLCD_WMS_URL = f"https://www.mrlc.gov/geoserver/mrlc_display/{NLCD_LAYER_NAME}/wms"
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def get_nlcd_vegetation_type(lat: float, lon: float) -> Optional[Dict]:
     """
     Fetch NLCD land cover classification for a point.
     Identifies wetland vegetation types.
+
     Source: MRLC (Multi-Resolution Land Characteristics Consortium) WMS/WCS
-    Endpoint: https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2019_Land_Cover_L48/wms
+    Endpoint: NLCD 2021 Land Cover (upgraded from 2019 on 2026-05-19)
+    NLCD 2021 improves wetland class accuracy for classes 90 and 95.
 
     Returns: {
         'nlcd_class': int,
         'class_name': str,
         'is_wetland_vegetation': bool,
-        'vegetation_type': str (e.g., 'Herbaceous Wetland', 'Woody Wetland')
+        'vegetation_type': str (e.g., 'Herbaceous Wetland', 'Woody Wetland'),
+        'nlcd_year': str  (e.g., '2021')
     }
     """
     try:
-        # MRLC WMS GetFeatureInfo (confirmed working 2026-05)
-        url = "https://www.mrlc.gov/geoserver/mrlc_display/NLCD_2019_Land_Cover_L48/wms"
-
         params = {
             "SERVICE": "WMS",
             "VERSION": "1.1.1",
             "REQUEST": "GetFeatureInfo",
-            "LAYERS": "NLCD_2019_Land_Cover_L48",
-            "QUERY_LAYERS": "NLCD_2019_Land_Cover_L48",
+            "LAYERS": NLCD_LAYER_NAME,
+            "QUERY_LAYERS": NLCD_LAYER_NAME,
             "INFO_FORMAT": "application/json",
             "BBOX": f"{lon - 0.01},{lat - 0.01},{lon + 0.01},{lat + 0.01}",
             "SRS": "EPSG:4326",
@@ -66,7 +80,7 @@ def get_nlcd_vegetation_type(lat: float, lon: float) -> Optional[Dict]:
             "Y": 50
         }
 
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(NLCD_WMS_URL, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
 
@@ -82,7 +96,8 @@ def get_nlcd_vegetation_type(lat: float, lon: float) -> Optional[Dict]:
                 "nlcd_class": pixel_value,
                 "class_name": class_label,
                 "is_wetland_vegetation": is_wetland,
-                "vegetation_type": NLCD_WETLAND_CLASSES[pixel_value] if is_wetland else "Non-wetland"
+                "vegetation_type": NLCD_WETLAND_CLASSES[pixel_value] if is_wetland else "Non-wetland",
+                "nlcd_year": NLCD_YEAR
             }
 
         return None
@@ -121,8 +136,6 @@ def get_nhd_proximity(lat: float, lon: float, search_radius_km: float = 5.0) -> 
             "REQUEST": "GetFeatureInfo",
             "LAYERS": "0",
             "QUERY_LAYERS": "0",
-            # NWI WMS supports: application/geo+json, application/vnd.esri.wms_raw_xml,
-            # text/xml, text/html, text/plain  (NOT application/json)
             "INFO_FORMAT": "application/geo+json",
             "BBOX": f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}",
             "SRS": "EPSG:4326",
@@ -140,7 +153,7 @@ def get_nhd_proximity(lat: float, lon: float, search_radius_km: float = 5.0) -> 
 
         if features:
             attrs = features[0].get("properties", {})
-            nwi_attr    = attrs.get("ATTRIBUTE", "")
+            nwi_attr     = attrs.get("ATTRIBUTE", "")
             wetland_type = attrs.get("WETLAND_TYPE", "")
 
             # Cowardin system: P=Palustrine, R=Riverine, L=Lacustrine → Strong
@@ -175,6 +188,45 @@ def get_nhd_proximity(lat: float, lon: float, search_radius_km: float = 5.0) -> 
         return None
 
 
+def get_ssurgo_water_table(lat: float, lon: float, drainage_class: Optional[str] = None) -> Optional[float]:
+    """
+    Estimate water table depth from SSURGO drainage class (fallback method).
+
+    For now uses drainage class as a proxy for water table depth until direct
+    comonth queries are fully operational.
+
+    Returns:
+        Estimated water table depth in cm, or None if unavailable
+
+    NRCS standard interpretations:
+    - Very Poorly Drained: water table 0-15 cm
+    - Poorly Drained: water table 0-30 cm
+    - Somewhat Poorly Drained: water table 30-60 cm
+    - Moderately Well Drained: water table 60-100 cm
+    - Well Drained / Excessively Drained: water table > 100 cm
+
+    Source: SSURGO drainage class field (established correlation with hydrology)
+    """
+    try:
+        if drainage_class:
+            drainage_lower = str(drainage_class).lower()
+
+            if "very poorly" in drainage_lower or "very poor" in drainage_lower:
+                return 10.0  # Estimate: 10 cm (strong signal)
+            elif "somewhat poorly" in drainage_lower or "somewhat poor" in drainage_lower:
+                return 45.0  # Estimate: 45 cm (possible signal)
+            elif "poorly" in drainage_lower or "poor" in drainage_lower:
+                return 25.0  # Estimate: 25 cm (strong signal)
+            else:
+                return None
+
+        return None
+
+    except Exception as e:
+        print(f"⚠️ Water table estimation failed: {e}")
+        return None
+
+
 def detect_wetland_hydrology_from_ssurgo(watertab_depth_cm: Optional[float]) -> Dict:
     """
     Interpret SSURGO watertab field to determine wetland hydrology.
@@ -194,10 +246,6 @@ def detect_wetland_hydrology_from_ssurgo(watertab_depth_cm: Optional[float]) -> 
             "watertab_depth_cm": None,
             "hydrology_signal": "Unknown"
         }
-
-    # NRCS definition: wetland hydrology typically requires watertable within:
-    # - 30 cm (strong signal) for poorly drained soils
-    # - 30-60 cm (possible signal) for very poorly drained soils
 
     if watertab_depth_cm <= 30:
         signal = "Strong"
@@ -228,15 +276,14 @@ def combine_wetland_indicators(
 
     PRIMARY indicators (used for determination):
       - hydric_soils: soil formed under prolonged saturation (SSURGO hydricrating)
-      - wetland_vegetation: hydrophytic vegetation (NLCD)
+      - wetland_vegetation: hydrophytic vegetation (NLCD 2021)
       - hydrology_ssurgo: high water table (SSURGO comonth)
-      - hydrology_nhd: proximity to water body (NHD)
+      - hydrology_nhd: proximity to water body (NWI/NHD)
 
     SUPPLEMENTARY indicators (supporting context, NOT counted toward determination):
       - poor_drainage: drainage class from SSURGO (derived from morphological features;
         useful screening signal but NOT a primary determining factor per NRCS Field
-        Indicators of Hydric Soils guidance. Official determination uses soil color,
-        mottling, gleying — already captured in hydricrating field.)
+        Indicators of Hydric Soils guidance.)
 
     Returns: {
         'is_likely_wetland': bool,
@@ -274,11 +321,8 @@ def combine_wetland_indicators(
         "drainage_class_label": drainage_class or ""
     }
 
-    # Count ONLY primary indicators toward confidence
     positive_count = sum(1 for v in indicators.values() if v)
 
-    # Determine confidence based on evidence convergence
-    # Per NRCS: Need hydric soils + (hydrology OR vegetation)
     if positive_count >= 3:
         confidence = "High"
         is_likely_wetland = True
@@ -294,9 +338,10 @@ def combine_wetland_indicators(
 
     # Determine wetland type
     if indicators["wetland_vegetation"]:
-        if "Herbaceous" in (vegetation.get("vegetation_type") if vegetation else ""):
+        veg_type = vegetation.get("vegetation_type", "") if vegetation else ""
+        if "Herbaceous" in veg_type:
             wetland_type = "Herbaceous Wetland"
-        elif "Woody" in (vegetation.get("vegetation_type") if vegetation else ""):
+        elif "Woody" in veg_type:
             wetland_type = "Woody Wetland"
         else:
             wetland_type = "Wetland (type unknown)"
@@ -305,7 +350,6 @@ def combine_wetland_indicators(
     elif indicators["hydric_soils"] and indicators["hydrology_ssurgo"]:
         wetland_type = "Hydric Soil — High Water Table"
     elif indicators["hydric_soils"]:
-        # Hydric soils only — likely drained/converted (e.g. prairie pothole)
         wetland_type = "Hydric Soil — Potential Restoration Site"
     else:
         wetland_type = "No wetland indicators detected"
