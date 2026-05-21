@@ -958,10 +958,15 @@ if "debug_logs" not in st.session_state:
 
 
 # --- 4. UI Configuration ---
-st.set_page_config(page_title="CRP HEL and Wetland Screening Tool (Prototype)", layout="wide")
+st.set_page_config(
+    page_title="CRP HEL and Wetland Screening Tool (Prototype)",
+    layout="wide",
+    initial_sidebar_state="collapsed",  # Mobile: sidebar starts closed; desktop: user can open
+)
 
 st.markdown("""
     <style>
+    /* ── Base styles (desktop unchanged) ── */
     .stMetric {
         background-color: #1e2129;
         padding: 15px;
@@ -986,6 +991,98 @@ st.markdown("""
         font-size: 11px;
         color: #ffccbc;
         line-height: 1.4;
+    }
+
+    /* ── Mobile: screens 768px and narrower ── */
+    @media (max-width: 768px) {
+
+        /* Stack all st.columns() vertically */
+        [data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+        }
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Map fills full width */
+        iframe {
+            width: 100% !important;
+            min-width: 100% !important;
+        }
+        /* Shorter map on phones so results are visible without scrolling far */
+        [data-testid="stIframe"] iframe {
+            height: 350px !important;
+        }
+
+        /* Full-width, large-tap buttons */
+        .stButton > button {
+            width: 100% !important;
+            padding: 12px 16px !important;
+            font-size: 16px !important;
+            margin-bottom: 8px !important;
+        }
+
+        /* Prevent iOS auto-zoom on input focus (needs 16px minimum) */
+        .stSelectbox select,
+        .stNumberInput input,
+        .stTextInput input {
+            font-size: 16px !important;
+        }
+        .stSelectbox > div,
+        .stNumberInput > div {
+            min-height: 44px !important;
+        }
+
+        /* Heading scale */
+        h1 { font-size: 1.4rem !important; }
+        h2 { font-size: 1.2rem !important; }
+        h3 { font-size: 1.1rem !important; }
+
+        /* Tighter page padding */
+        .main .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            padding-top: 0.75rem !important;
+        }
+
+        /* Banners readable at smaller size */
+        .r-banner, .ei-notice {
+            font-size: 13px;
+            padding: 10px 12px;
+        }
+
+        /* Wide tables scroll horizontally instead of squishing */
+        [data-testid="stDataFrame"] {
+            overflow-x: auto !important;
+        }
+        [data-testid="stDataFrame"] > div {
+            min-width: 0 !important;
+        }
+
+        /* Tab bar scrolls horizontally on mobile */
+        [data-testid="stTabs"] [role="tablist"] {
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+        }
+        [data-testid="stTabs"] [role="tablist"]::-webkit-scrollbar { display: none; }
+        [data-testid="stTabs"] [role="tab"] {
+            white-space: nowrap !important;
+            font-size: 13px !important;
+            padding: 8px 12px !important;
+        }
+    }
+
+    /* ── Small phones: 480px and narrower ── */
+    @media (max-width: 480px) {
+        h1 { font-size: 1.15rem !important; }
+        .stMetric { padding: 10px; }
+        [data-testid="stIframe"] iframe {
+            height: 300px !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -2031,7 +2128,7 @@ with col_map:
         ).add_to(m)
         m.fit_bounds(st.session_state["current_bounds"])
 
-    map_output = st_folium(m, width="100%", height=650, key="crp_master_map")
+    map_output = st_folium(m, width="100%", height=500, key="crp_master_map")
 
     # Drawn polygon handler with normalize + rate limit
     if map_output and map_output.get("all_drawings") and can_make_request():
