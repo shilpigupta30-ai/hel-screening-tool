@@ -40,7 +40,7 @@ except ImportError:
     WETLAND_FEATURES_AVAILABLE = False
 
 # =============================================================================
-# CRP HEL Screening & CP Recommendation Tool — v16
+# CRP HEL Screening & CP Recommendation Tool — v17
 # Full changelog:
 #   v9:  R-factor fetched at runtime via Nominatim + NRCS FOTG 50-state table
 #        EI formula corrected to R * K * LS / T (was missing R — 2100% error)
@@ -67,6 +67,21 @@ except ImportError:
 #        Priority chain: Raster → NOAA CDO → State FOTG → National Default
 #        Raster downloaded once to /tmp at startup, cached for session lifetime
 #        Reduces R-factor error from ±5-8% (NOAA CDO) to ±1-3% (raster lookup)
+#   v17: Polygon area calculation + CPA-026e PDF upgrade + AD-1026 (2026-05-25)
+#        calculate_polygon_acres(): shapely + pyproj EPSG:5070 area from drawn polygon
+#        wkt_to_acres(): parse WKT string → acres
+#        calculate_ssurgo_acres_per_mukey(): NRCS method — fetches mupolygon WKT from
+#          SDA, shapely-intersects each soil polygon with field boundary, computes
+#          per-soil-unit acres via EPSG:5070 projection (same as NRCS GIS tools)
+#        Polygon acres stored in session state at draw time
+#        generate_cpa026e_pdf(): rebuilt to match official NRCS-CPA-026e (8/2013) layout
+#        Section I (HEL) + Section II (Wetlands) — both now present
+#        Acres: SSURGO intersection method primary, polygon÷rows fallback
+#        County + State auto-filled from reverse geocoding
+#        generate_ad1026_pdf(): FSA AD-1026 HELC/WC Certification pre-fill
+#          Auto-fills: Crop Year, County, State, Land Use, HEL screening result
+#          Farmer fills: Name, Tax ID, Yes/No questions, Signature
+#          Available as download in Farmer Mode
 # =============================================================================
 
 # =============================================================================
@@ -760,6 +775,110 @@ def get_state_r_factor(lat, lon, debug=False):
     return R_FACTORS["DEFAULT"], "National Default - NRCS National Average (±20-30% error)", "National Default"
 
 
+def calculate_ssurgo_acres_per_mukey(field_wkt):
+    """
+    Calculate per-soil-map-unit acreage the NRCS way:
+      1. Query SDA for soil polygon geometries (mupolygon) intersecting the field
+      2. shapely-intersect each soil polygon with the drawn field boundary
+      3. Project intersection to EPSG:5070 (Albers Equal Area) and compute area
+      4. Return dict of {muname: acres} matching NRCS CPA-026e acreage method
+
+    This replicates what NRCS GIS tools do — each soil map unit gets its actual
+    clipped acreage within the field, not an equal split of total area.
+
+    Args:
+        field_wkt: WKT POLYGON string of the drawn field boundary (WGS84)
+
+    Returns:
+        dict: {muname (str): acres (float)} — empty dict on failure
+        str:  error message or None
+    """
+    try:
+        from shapely.wkt import loads as wkt_loads
+        from shapely.ops import transform as shp_transform
+        from shapely.validation import make_valid
+        import pyproj
+
+        SDA_URL = "https://sdmdataaccess.nrcs.usda.gov/Tabular/post.rest"
+
+        # Step 1 — Fetch soil polygon WKT for all mukeys intersecting the field
+        # mupolygongeo is the WGS84 geometry column in SDA's mupolygon table
+        query = f"""
+        SELECT mp.mukey, mu.muname, mp.mupolygongeo.STAsText() AS wkt_geo
+        FROM mupolygon mp
+        INNER JOIN mapunit mu ON mp.mukey = mu.mukey
+        WHERE mp.mukey IN (
+            SELECT * FROM SDA_Get_Mukey_from_intersection_with_WktWgs84('{field_wkt}')
+        )
+        """
+
+        resp = requests.post(
+            SDA_URL,
+            data={"query": query, "format": "json"},
+            timeout=60
+        )
+        resp.raise_for_status()
+
+        if resp.text.strip().startswith("<"):
+            return {}, "SSURGO API returned HTML (maintenance or error)"
+
+        data = resp.json()
+        rows = data.get("Table", [])
+        if not rows:
+            return {}, "No soil polygons returned from SSURGO"
+
+        # Step 2 — Set up projection: WGS84 → EPSG:5070 (Albers Equal Area CONUS)
+        projector = pyproj.Transformer.from_crs(
+            "EPSG:4326", "EPSG:5070", always_xy=True
+        ).transform
+
+        def acres_from_poly(poly):
+            projected = shp_transform(projector, poly)
+            return projected.area / 4046.856
+
+        # Step 3 — Parse field polygon
+        field_poly = wkt_loads(field_wkt)
+        if not field_poly.is_valid:
+            field_poly = make_valid(field_poly)
+
+        # Step 4 — Intersect each soil polygon with field, accumulate acres per muname
+        muname_acres = {}
+        for row in rows:
+            mukey   = str(row[0])
+            muname  = str(row[1]) if row[1] else f"Soil {mukey}"
+            wkt_geo = row[2]
+
+            if not wkt_geo:
+                continue
+            try:
+                soil_poly = wkt_loads(wkt_geo)
+                if not soil_poly.is_valid:
+                    soil_poly = make_valid(soil_poly)
+
+                intersection = field_poly.intersection(soil_poly)
+                if intersection.is_empty:
+                    continue
+
+                acres = acres_from_poly(intersection)
+                if acres < 0.01:
+                    continue
+
+                # Accumulate — same muname can appear in multiple polygon rows
+                muname_acres[muname] = muname_acres.get(muname, 0.0) + acres
+
+            except Exception:
+                continue
+
+        # Round to 1 decimal
+        muname_acres = {k: round(v, 1) for k, v in muname_acres.items()}
+        return muname_acres, None
+
+    except requests.exceptions.Timeout:
+        return {}, "SSURGO acreage query timed out"
+    except Exception as e:
+        return {}, f"SSURGO acreage error: {str(e)}"
+
+
 def fetch_nrcs_data(wkt):
     """Queries USDA Soil Data Access API for soil properties within WKT polygon."""
     url = "https://sdmdataaccess.nrcs.usda.gov/Tabular/post.rest"
@@ -1261,12 +1380,69 @@ with st.sidebar:
 # VIEW FUNCTIONS FOR TWO-TIER UI
 # =============================================================================
 
-def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei_min, center_lat, center_lon):
+# ─────────────────────────────────────────────────────────────────────────────
+# POLYGON AREA CALCULATION (v17)
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_polygon_acres(coords):
     """
-    Generate PDF with pre-filled NRCS-CPA-026 form data.
+    Calculate polygon area in acres from list of [lon, lat] coordinate pairs.
+    Uses pyproj EPSG:5070 (Albers Equal Area CONUS) for accuracy.
+    Returns (acres_float, acres_string) or (None, "___") on failure.
+    """
+    try:
+        from shapely.geometry import Polygon
+        from shapely.ops import transform
+        import pyproj
 
-    Form: NRCS-CPA-026 "Highly Erodible Land and Wetland Conservation Determination"
-    This is the official NRCS form for documenting HEL determinations with RUSLE2 parameters.
+        if not coords or len(coords) < 3:
+            return None, "___"
+
+        poly = Polygon([(c[0], c[1]) for c in coords])  # coords are [lon, lat]
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        projector = pyproj.Transformer.from_crs(
+            "EPSG:4326", "EPSG:5070", always_xy=True
+        ).transform
+        area_m2 = transform(projector, poly).area
+        acres = area_m2 / 4046.856
+
+        if acres < 0.1:
+            return None, "___"
+        return round(acres, 1), f"{acres:.1f}"
+
+    except Exception:
+        return None, "___"
+
+
+def wkt_to_acres(wkt_string):
+    """
+    Parse a WKT POLYGON string and return (acres_float, acres_string).
+    E.g. 'POLYGON((-94.38 42.02, -94.36 42.02, ...))'
+    """
+    try:
+        import re
+        nums = re.findall(r"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)", wkt_string)
+        coords = [[float(lon), float(lat)] for lon, lat in nums]
+        return calculate_polygon_acres(coords)
+    except Exception:
+        return None, "___"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NRCS-CPA-026e PDF GENERATOR (v17)
+# Matches official NRCS-CPA-026e (8/2013) layout
+# Section I: HEL determination with RUSLE2 parameters
+# Section II: Wetlands from hydric soil indicators
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source,
+                         df, ei_max, ei_min,
+                         center_lat, center_lon,
+                         county="", state_name="",
+                         polygon_acres=None,
+                         muname_acres=None):
+    """
+    Generate pre-filled NRCS-CPA-026e PDF matching official form layout.
 
     Args:
         r_val: R-factor value
@@ -1278,6 +1454,10 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         ei_min: Minimum EI value
         center_lat: Field center latitude
         center_lon: Field center longitude
+        county: County name (auto-filled from reverse geocoding)
+        state_name: State name (auto-filled from reverse geocoding)
+        polygon_acres: Total field area in acres (fallback if muname_acres unavailable)
+        muname_acres: Dict {muname: acres} from SSURGO intersection — NRCS method
 
     Returns:
         bytes: PDF document ready for download
@@ -1286,207 +1466,726 @@ def generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
         from reportlab.lib.units import inch
-        from datetime import datetime
+        from reportlab.lib import colors
         from io import BytesIO
+
+        if muname_acres is None:
+            muname_acres = {}
 
         pdf_buffer = BytesIO()
         c = canvas.Canvas(pdf_buffer, pagesize=letter)
-        width, height = letter
+        w, h = letter
+        ml = 0.5 * inch
+        mr = 0.5 * inch
+        cw = w - ml - mr
+        y  = h - 0.5 * inch
 
-        # Margins - increased for better whitespace
-        margin_left = 0.6 * inch
-        margin_right = 0.6 * inch
-        margin_top = 0.6 * inch
-        current_y = height - margin_top
-        line_height = 0.14 * inch  # Increased for more breathing room
+        # Determine total acres for subtitle
+        if muname_acres:
+            total_acres = sum(muname_acres.values())
+            acres_str   = f"{total_acres:.1f}"
+        elif polygon_acres:
+            total_acres = polygon_acres
+            acres_str   = f"{polygon_acres:.1f}"
+        else:
+            total_acres = None
+            acres_str   = "___"
 
-        # ═══════════════════════════════════════════════════════════
-        # FORM HEADER
-        # ═══════════════════════════════════════════════════════════
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(margin_left, current_y, "NRCS-CPA-026")
-        c.setFont("Helvetica-Bold", 11)
-        current_y -= line_height * 1.3
-        c.drawString(margin_left, current_y, "HIGHLY ERODIBLE LAND AND WETLAND CONSERVATION DETERMINATION")
-        current_y -= line_height * 1.5
+        num_rows = len(df) if not df.empty else 1
 
-        # Form info
-        c.setFont("Helvetica", 9)
-        c.drawString(margin_left, current_y, "Generated by: CRP HEL Screening Tool (SCREENING ONLY)")
-        current_y -= line_height
-        c.drawString(margin_left, current_y, f"Date: {datetime.now().strftime('%m/%d/%Y')}  |  Coordinates: {center_lat:.4f}°N, {center_lon:.4f}°W")
-        current_y -= line_height * 2
+        def get_row_acres(soil_name):
+            """
+            Get acres for a soil type — SSURGO intersection first, fallback equal split.
+            SSURGO munames include slope descriptors e.g. 'Clarion loam, Bemis moraine,
+            2 to 6 percent slopes' — we sum ALL variants that start with the soil name
+            since fetch_nrcs_data returns the base name only (e.g. 'Clarion loam').
+            """
+            if muname_acres:
+                total = sum(
+                    ac for muname, ac in muname_acres.items()
+                    if muname.lower().startswith(soil_name.lower())
+                )
+                return f"{total:.1f}" if total > 0 else "___"
+            elif polygon_acres:
+                return f"{polygon_acres / num_rows:.1f}"
+            return "___"
 
-        # ═══════════════════════════════════════════════════════════
-        # SECTION A: FARM/FIELD IDENTIFICATION
-        # ═══════════════════════════════════════════════════════════
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_left, current_y, "SECTION A: FARM AND FIELD INFORMATION")
-        current_y -= line_height * 1.3
+        def hline(ypos, thickness=0.5):
+            c.setLineWidth(thickness)
+            c.line(ml, ypos, w - mr, ypos)
 
-        c.setFont("Helvetica", 10)
-        form_data = [
-            ("Name:", "________________________________________"),
-            ("Address:", "________________________________________"),
-            ("County:", "__________________  State: ___  Zip: __________"),
-            ("FSA Farm No.:", "_______________  Tract No.: _______________"),
-        ]
+        def blue_bar(ypos, title, fsize=10):
+            """Blue section header bar. Returns y safely below bar."""
+            bh = 0.30 * inch
+            c.setFillColor(colors.HexColor("#003366"))
+            c.rect(ml, ypos - bh, cw, bh, fill=1, stroke=0)
+            c.setFillColor(colors.white)
+            c.setFont("Helvetica-Bold", fsize)
+            c.drawString(ml + 0.12*inch, ypos - bh + 0.10*inch, title)
+            c.setFillColor(colors.black)
+            return ypos - bh - 0.25*inch  # safe gap below bar
 
-        for label, blank in form_data:
-            c.drawString(margin_left + 0.2*inch, current_y, label)
-            c.drawString(margin_left + 1.5*inch, current_y, blank)
-            current_y -= line_height * 1.1
+        def field_box(x, ytop, bw, bh, label, value):
+            c.setLineWidth(0.5)
+            c.setFillColor(colors.white)
+            c.rect(x, ytop - bh, bw, bh, fill=1, stroke=1)
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(x + 0.06*inch, ytop - 0.14*inch, label)
+            c.setFont("Helvetica", 9)
+            c.drawString(x + 0.06*inch, ytop - bh + 0.09*inch, value)
 
-        current_y -= line_height * 1.2  # Increased spacing before next section
-
-        # ═══════════════════════════════════════════════════════════
-        # SECTION B: HIGHLY ERODIBLE LAND (HEL) DETERMINATION
-        # ═══════════════════════════════════════════════════════════
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_left, current_y, "SECTION B: HIGHLY ERODIBLE LAND (HEL) DETERMINATION")
-        current_y -= line_height * 1.3
-
-        c.setFont("Helvetica", 9)
-        c.drawString(margin_left + 0.2*inch, current_y, "Erosion Index (EI) Calculation: EI = (R × K × LS) / T")
-        current_y -= line_height
-
-        # RUSLE2 Parameters Table
+        # ── TOP HEADER BAR ───────────────────────────────────────────
+        bh = 0.30 * inch
+        c.setFillColor(colors.HexColor("#003366"))
+        c.rect(ml, y - bh, cw, bh, fill=1, stroke=0)
+        c.setFillColor(colors.white)
         c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin_left + 0.2*inch, current_y, "RUSLE2 Parameters:")
-        current_y -= line_height * 1.2
-
-        k_avg = df["K-Fact"].mean() if not df.empty else 0
-        k_min = df["K-Fact"].min() if not df.empty else 0
-        k_max = df["K-Fact"].max() if not df.empty else 0
-        t_avg = df["T-Fact"].mean() if not df.empty else 0
-        t_min = df["T-Fact"].min() if not df.empty else 0
-        t_max = df["T-Fact"].max() if not df.empty else 0
-        ls_display = f"{ls_factor:.3f}" if ls_factor else "Approximated"
-
-        # Format R-Factor - parameter on line 1, source on line 2
-        c.setFont("Helvetica", 10)
-        c.drawString(margin_left + 0.3*inch, current_y, f"R-Factor (Rainfall): {r_val:.1f}")
-        current_y -= line_height * 0.85
-        c.setFont("Helvetica", 9)  # Increased from 8 to 9
-        c.drawString(margin_left + 0.5*inch, current_y, f"Source: {state_label}")
-        current_y -= line_height * 1.6  # Increased spacing between parameters
-
-        # Format K-Factor - parameter on line 1, range on line 2
-        c.setFont("Helvetica", 10)
-        c.drawString(margin_left + 0.3*inch, current_y, f"K-Factor (Soil): {k_avg:.4f}")
-        current_y -= line_height * 0.85
-        c.setFont("Helvetica", 9)  # Increased from 8 to 9
-        c.drawString(margin_left + 0.5*inch, current_y, f"Range: {k_min:.4f}–{k_max:.4f}")
-        current_y -= line_height * 1.6  # Increased spacing between parameters
-
-        # Format LS-Factor - parameter on line 1, source on line 2
-        c.setFont("Helvetica", 10)
-        c.drawString(margin_left + 0.3*inch, current_y, f"LS-Factor (Slope): {ls_display}")
-        current_y -= line_height * 0.85
-        c.setFont("Helvetica", 9)  # Increased from 8 to 9
-        c.drawString(margin_left + 0.5*inch, current_y, f"Source: {ls_source}")
-        current_y -= line_height * 1.6  # Increased spacing between parameters
-
-        # Format T-Factor - parameter on line 1, range on line 2
-        c.setFont("Helvetica", 10)
-        c.drawString(margin_left + 0.3*inch, current_y, f"T-Factor (Tolerance): {t_avg:.2f} t/ac/yr")
-        current_y -= line_height * 0.85
-        c.setFont("Helvetica", 9)  # Increased from 8 to 9
-        c.drawString(margin_left + 0.5*inch, current_y, f"Range: {t_min:.2f}–{t_max:.2f}")
-        current_y -= line_height * 1.8  # Extra space before EI result
-
-        current_y -= line_height * 0.3
-
-        # Determination Result
-        c.setFont("Helvetica-Bold", 10)
-        hel_status = "HEL" if ei_max >= 8.0 else "NOT HEL"
-        status_symbol = "☒" if ei_max >= 8.0 else "☐"
-        c.drawString(margin_left + 0.2*inch, current_y, f"{status_symbol} EROSION INDEX: {ei_max:.2f} → {hel_status}")
+        c.drawString(ml + 0.10*inch, y - bh + 0.10*inch, "NRCS-CPA-026e   (8/2013)")
         c.setFont("Helvetica", 8)
-        current_y -= line_height
-        c.drawString(margin_left + 0.5*inch, current_y, f"(Range: {ei_min:.2f}–{ei_max:.2f})")
-        current_y -= line_height * 2.0  # Increased spacing before next section
+        c.drawRightString(w - mr - 0.10*inch, y - bh + 0.10*inch,
+            "U.S. DEPARTMENT OF AGRICULTURE — Natural Resources Conservation Service")
+        y = y - bh - 0.25*inch  # safe gap below bar
 
-        # ═══════════════════════════════════════════════════════════
-        # SECTION C: FIELD DETERMINATION TABLE
-        # ═══════════════════════════════════════════════════════════
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_left, current_y, "SECTION C: FIELD SUMMARY TABLE")
-        current_y -= line_height * 1.2
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(w/2, y,
+            "HIGHLY ERODIBLE LAND AND WETLAND CONSERVATION DETERMINATION")
+        y -= 0.22*inch
 
-        # Table headers
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.HexColor("#555555"))
+        c.drawCentredString(w/2, y,
+            f"Pre-filled by CRP HEL Screening Tool  |  "
+            f"Coordinates: {center_lat:.4f}°N, {abs(center_lon):.4f}°W"
+            + (f"  |  Field Area: {acres_str} acres" if total_acres else ""))
+        c.setFillColor(colors.black)
+        y -= 0.14*inch
+        hline(y, 1.2)
+        y -= 0.20*inch
+
+        # ── INFO BOXES ───────────────────────────────────────────────
+        ibh = 0.36*inch; gap = 0.04*inch
+        w1=cw*0.295; w2=cw*0.295; w3=cw*0.195; w4=cw*0.195
+        x1=ml; x2=x1+w1+gap; x3=x2+w2+gap; x4=x3+w3+gap
+
+        field_box(x1, y, w1, ibh, "Name:", "")
+        field_box(x2, y, w2, ibh, "Address:", "")
+        field_box(x3, y, w3, ibh, "Request Date:", datetime.now().strftime('%m/%d/%Y'))
+        field_box(x4, y, w4, ibh, "County:", county)
+        y -= ibh + gap
+
+        field_box(x1, y, w1, ibh, "Agency or Person Requesting:", "")
+        field_box(x2, y, w2, ibh, "Tract No.:", "")
+        field_box(x3, y, w3, ibh, "FSA Farm No.:", "")
+        field_box(x4, y, w4, ibh, "State:", state_name)
+        y -= ibh + 0.22*inch
+
+        # ── SECTION I: HEL ───────────────────────────────────────────
+        y = blue_bar(y, "SECTION I — HIGHLY ERODIBLE LAND (HEL)")
+
+        c.setFont("Helvetica", 8.5)
+        c.drawString(ml+0.12*inch, y,
+            "Is a soil survey now available for making a highly erodible land determination?")
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(w - mr - 1.05*inch, y, "\u2612 Yes    \u2610 No")
+        y -= 0.26*inch
+
+        hel_present = ei_max >= 8.0
+        c.setFont("Helvetica", 8.5)
+        c.drawString(ml+0.12*inch, y, "Are there highly erodible soil map units on this farm?")
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(w - mr - 1.05*inch, y,
+            "\u2612 Yes    \u2610 No" if hel_present else "\u2610 Yes    \u2612 No")
+        y -= 0.26*inch
+
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#444444"))
+        c.drawString(ml+0.12*inch, y,
+            "Fields below have undergone HEL determination. "
+            "Fields without a completed determination are not listed.")
+        y -= 0.18*inch
+        c.drawString(ml+0.12*inch, y,
+            "To be eligible for USDA benefits, a person must use an "
+            "approved conservation system on all HEL fields.")
+        c.setFillColor(colors.black)
+        y -= 0.26*inch
+
+        k_avg = df["K-Fact"].mean() if not df.empty and "K-Fact" in df.columns else 0
+        t_avg = df["T-Fact"].mean() if not df.empty and "T-Fact" in df.columns else 0
+        ls_disp = f"{ls_factor:.3f}" if ls_factor else "N/A"
+        src = (state_label.split(" - ")[0][:28]
+               if " - " in state_label else state_label[:28])
+
         c.setFont("Helvetica-Bold", 8)
-        col_x = [margin_left + 0.2*inch, margin_left + 2.0*inch, margin_left + 2.8*inch,
-                 margin_left + 3.6*inch, margin_left + 4.4*inch, margin_left + 5.2*inch]
-        headers = ["Field", "HEL", "EI Value", "Acres", "Det. Date", "Sodbust"]
-
-        for i, header in enumerate(headers):
-            c.drawString(col_x[i], current_y, header)
-
-        current_y -= line_height * 0.9
-        c.setLineWidth(1)
-        c.line(margin_left + 0.1*inch, current_y + line_height*0.2, width - margin_right, current_y + line_height*0.2)
-        current_y -= line_height * 0.3
-
-        # Table rows (one per soil component) - increased row height for readability
+        c.drawString(ml+0.12*inch, y,
+            "RUSLE2 Screening Parameters (EI = R \u00d7 K \u00d7 LS / T):")
+        y -= 0.20*inch
         c.setFont("Helvetica", 8)
-        for idx, row in df.iterrows():
-            soil_type = str(row.get("Soil Type", "Field"))[:20]
-            hel = "Y" if row.get("EI", 0) >= 8.0 else "N"
-            ei_val = f"{row.get('EI', 0):.1f}"
-            acres = "___"  # User fills in
-            det_date = datetime.now().strftime('%m/%d/%Y')
-            sodbust = "___"  # User fills in
+        c.drawString(ml+0.20*inch, y,
+            f"R={r_val:.1f} ({src})     K={k_avg:.4f} (SSURGO)     "
+            f"LS={ls_disp} (USGS 3DEP)     T={t_avg:.2f} t/ac/yr (SSURGO)"
+            f"     EI={ei_max:.2f}")
+        y -= 0.26*inch
 
-            c.drawString(col_x[0], current_y, soil_type)
-            c.drawString(col_x[1], current_y, hel)
-            c.drawString(col_x[2], current_y, ei_val)
-            c.drawString(col_x[3], current_y, acres)
-            c.drawString(col_x[4], current_y, det_date)
-            c.drawString(col_x[5], current_y, sodbust)
-            current_y -= line_height * 1.2  # Increased from 1.0 for better spacing
+        # HEL table
+        th=0.24*inch; tr=0.22*inch
+        tc =[ml, ml+cw*0.35, ml+cw*0.44, ml+cw*0.55, ml+cw*0.67, ml+cw*0.85]
+        tcw=[cw*0.35, cw*0.09, cw*0.11, cw*0.12, cw*0.18, cw*0.15]
+        hdrs=["Field / Soil Map Unit","HEL\n(Y/N)","Sodbust\n(Y/N)",
+              "Acres","Det. Date","EI Score\n(Screening)"]
 
-        current_y -= line_height * 1.2  # Increased spacing before next section
+        c.setFillColor(colors.HexColor("#D6E4F0"))
+        for tx,tw in zip(tc,tcw): c.rect(tx, y-th, tw, th, fill=1, stroke=1)
+        c.setFillColor(colors.HexColor("#003366"))
+        c.setFont("Helvetica-Bold", 7.5)
+        for i,(tx,tw) in enumerate(zip(tc,tcw)):
+            parts = hdrs[i].split("\n")
+            if len(parts)==2:
+                c.drawCentredString(tx+tw/2, y-th*0.38, parts[0])
+                c.drawCentredString(tx+tw/2, y-th*0.72, parts[1])
+            else:
+                c.drawCentredString(tx+tw/2, y-th*0.57, parts[0])
+        c.setFillColor(colors.black)
+        y -= th
 
-        # ═══════════════════════════════════════════════════════════
-        # SECTION D: CERTIFICATIONS (NRCS Staff use)
-        # ═══════════════════════════════════════════════════════════
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(margin_left, current_y, "SECTION D: DETERMINATION CERTIFICATION")
-        current_y -= line_height * 1.2
+        for _, row in df.iterrows():
+            soil  = str(row.get("Soil Type",""))[:32]
+            ei_v  = row.get("EI", 0)
+            hel   = "Y" if ei_v >= 8.0 else "N"
+            row_acres = get_row_acres(soil)
+            fill = colors.HexColor("#FFF8E1") if hel=="Y" else colors.white
+            for tx,tw in zip(tc,tcw):
+                c.setFillColor(fill); c.rect(tx, y-tr, tw, tr, fill=1, stroke=1)
+            c.setFillColor(colors.black); c.setFont("Helvetica", 8.5)
+            vals=[soil, hel, "___", row_acres,
+                  datetime.now().strftime('%m/%d/%Y'), f"{ei_v:.1f}"]
+            for j,(tx,tw) in enumerate(zip(tc,tcw)):
+                if j==0: c.drawString(tx+0.07*inch, y-tr*0.57, vals[j])
+                else:    c.drawCentredString(tx+tw/2, y-tr*0.57, vals[j])
+            y -= tr
 
+        y -= 0.14*inch
         c.setFont("Helvetica", 8)
-        c.drawString(margin_left + 0.2*inch, current_y, "Determined by (NRCS Staff): _________________________  Date: __________")
-        current_y -= line_height * 1.1
-        c.drawString(margin_left + 0.2*inch, current_y, "Reviewed by (NRCS Staff): _________________________  Date: __________")
-        current_y -= line_height * 1.5
+        c.drawString(ml+0.12*inch, y,
+            f"The Highly Erodible Land determination was completed using "
+            f"RUSLE2 screening data on {datetime.now().strftime('%m/%d/%Y')}."
+            + (f"  Total field area: {acres_str} acres." if total_acres else "")
+            + (" Acreage per SSURGO intersection." if muname_acres else
+               " Acreage estimated from polygon area." if polygon_acres else ""))
+        y -= 0.30*inch
 
-        # ═══════════════════════════════════════════════════════════
-        # FOOTER: IMPORTANT DISCLAIMER
-        # ═══════════════════════════════════════════════════════════
+        # ── SECTION II: WETLANDS ─────────────────────────────────────
+        y = blue_bar(y, "SECTION II — WETLANDS")
+
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#444444"))
+        c.drawString(ml+0.12*inch, y,
+            "Fields below have had wetland determinations completed.")
+        c.setFillColor(colors.black)
+        y -= 0.26*inch
+
+        wc =[ml, ml+cw*0.30, ml+cw*0.50, ml+cw*0.65, ml+cw*0.80]
+        ww =[cw*0.30, cw*0.20, cw*0.15, cw*0.15, cw*0.20]
+        whdrs=["Field / Soil Map Unit","Wetland (Y/N)","Conv. Wetland","Acres","Det. Date"]
+
+        c.setFillColor(colors.HexColor("#D6E4F0"))
+        for tx,tw in zip(wc,ww): c.rect(tx, y-th, tw, th, fill=1, stroke=1)
+        c.setFillColor(colors.HexColor("#003366"))
+        c.setFont("Helvetica-Bold", 7.5)
+        for tx,tw,hdr in zip(wc,ww,whdrs):
+            c.drawCentredString(tx+tw/2, y-th*0.57, hdr)
+        c.setFillColor(colors.black)
+        y -= th
+
+        hydric = (df[df["Hydric"]=="Yes"]
+                  if "Hydric" in df.columns else df.iloc[0:0])
+        if len(hydric) > 0:
+            for _, row in hydric.iterrows():
+                soil = str(row.get("Soil Type",""))[:32]
+                w_acres = get_row_acres(soil)
+                for tx,tw in zip(wc,ww):
+                    c.setFillColor(colors.HexColor("#E8F5E9"))
+                    c.rect(tx, y-tr, tw, tr, fill=1, stroke=1)
+                c.setFillColor(colors.black); c.setFont("Helvetica", 8.5)
+                vals=[soil,"Y","___", w_acres, datetime.now().strftime('%m/%d/%Y')]
+                for i,(tx,tw) in enumerate(zip(wc,ww)):
+                    if i==0: c.drawString(tx+0.07*inch, y-tr*0.57, vals[i])
+                    else:    c.drawCentredString(tx+tw/2, y-tr*0.57, vals[i])
+                y -= tr
+            for _ in range(2):
+                for tx,tw in zip(wc,ww): c.rect(tx, y-tr, tw, tr, fill=0, stroke=1)
+                y -= tr
+        else:
+            for _ in range(3):
+                for tx,tw in zip(wc,ww): c.rect(tx, y-tr, tw, tr, fill=0, stroke=1)
+                y -= tr
+
+        y -= 0.16*inch
+        c.setFont("Helvetica", 8)
+        c.drawString(ml+0.12*inch, y,
+            "Wetland indicators based on: SSURGO hydric soils, drainage class, "
+            "NLCD vegetation, NHD proximity.")
+        y -= 0.20*inch
+        c.setFont("Helvetica-Bold", 8)
+        c.setFillColor(colors.HexColor("#CC0000"))
+        c.drawString(ml+0.12*inch, y,
+            "\u26a0  Official wetland determination requires field verification by NRCS staff.")
+        c.setFillColor(colors.black)
+        y -= 0.32*inch
+
+        # ── CERTIFICATION ────────────────────────────────────────────
+        hline(y, 1)
+        y -= 0.20*inch
         c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin_left, current_y, "⚠️  IMPORTANT DISCLAIMER")
-        current_y -= line_height * 0.9
+        c.drawString(ml+0.12*inch, y, "CERTIFICATION")
+        y -= 0.24*inch
+        c.setFont("Helvetica", 8.5)
+        c.drawString(ml+0.12*inch, y,
+            "Determined by (NRCS Staff): "
+            "____________________________________   Date: ______________")
+        y -= 0.26*inch
+        c.drawString(ml+0.12*inch, y,
+            "Reviewed by (NRCS Staff):   "
+            "____________________________________   Date: ______________")
+        y -= 0.32*inch
 
-        c.setFont("Helvetica", 7.5)
-        disclaimer = [
-            "This document is a SCREENING TOOL OUTPUT generated by the CRP HEL Screening Tool.",
-            "It is NOT an official NRCS-CPA-026 form and does NOT constitute an official NRCS HEL determination.",
-            "Official determinations must be completed by NRCS staff following 7 CFR Part 12 procedures.",
-            "All values are estimates based on available data and must be verified in the field by qualified conservationists.",
-            "For official determination, contact your local NRCS Service Center."
-        ]
+        # ── FOOTER ───────────────────────────────────────────────────
+        hline(y, 0.5)
+        y -= 0.18*inch
+        c.setFont("Helvetica-Oblique", 7)
+        c.setFillColor(colors.HexColor("#666666"))
+        for footer_line in [
+            "SCREENING OUTPUT ONLY — Pre-filled by CRP HEL Screening Tool "
+            "using public data (SSURGO, NOAA, USGS 3DEP, NLCD, NHD).",
+            "Does NOT constitute an official NRCS determination per 7 CFR Part 12. "
+            "Must be completed by qualified NRCS staff.",
+            "Contact your local NRCS Service Center for an official determination.",
+        ]:
+            c.drawString(ml+0.10*inch, y, footer_line)
+            y -= 0.16*inch
 
-        for line in disclaimer:
-            c.drawString(margin_left + 0.1*inch, current_y, line)
-            current_y -= line_height * 0.8
-
+        c.setFillColor(colors.black)
         c.save()
         pdf_buffer.seek(0)
         return pdf_buffer.getvalue()
 
     except Exception as e:
         st.error(f"Error generating PDF: {str(e)}")
+        return None
+
+
+def generate_ad1026_pdf(county="", state_name="", land_use="", ei_max=None, hel_present=False, wetland_present=False):
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from io import BytesIO
+        pdf_buffer = BytesIO()
+        c = canvas.Canvas(pdf_buffer, pagesize=letter)
+        w, h = letter
+        ml = 0.55 * inch
+        mr = 0.55 * inch
+        cw = w - ml - mr
+        crop_year = str(datetime.now().year)
+
+        def hline(y, t=0.5):
+            c.setLineWidth(t)
+            c.line(ml, y, w - mr, y)
+
+        def wrap_text(text, x, y, max_w, font, size, leading=0.13*inch):
+            """Word-wrap text, return final y position."""
+            c.setFont(font, size)
+            words = text.split()
+            line = ""
+            for word in words:
+                test = (line + " " + word).strip()
+                if c.stringWidth(test, font, size) > max_w:
+                    c.drawString(x, y, line)
+                    y -= leading
+                    line = word
+                else:
+                    line = test
+            if line:
+                c.drawString(x, y, line)
+                y -= leading
+            return y
+
+        def field_box(x, ytop, bw, bh, label, value="", ls=7, vs=9, filled=False):
+            c.setLineWidth(0.5)
+            c.setFillColor(colors.white)
+            c.rect(x, ytop-bh, bw, bh, fill=1, stroke=1)
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", ls)
+            c.drawString(x+0.05*inch, ytop-0.13*inch, label)
+            if value:
+                c.setFont("Helvetica", vs)
+                c.setFillColor(colors.black)
+                c.drawString(x+0.05*inch, ytop-bh+0.08*inch, value)
+                c.setFillColor(colors.black)
+
+        def checkbox_wrap(x, y, label, font_size=7.5):
+            """Checkbox with word-wrapped label — stays within page margins."""
+            c.setLineWidth(0.5)
+            box_size = 0.11*inch
+            c.rect(x, y - box_size, box_size, box_size, fill=0, stroke=1)
+            # Text starts after checkbox, wraps within page width
+            text_x = x + 0.18*inch
+            text_max = w - mr - text_x
+            y = wrap_text(label, text_x, y - 0.02*inch, text_max, "Helvetica", font_size, 0.13*inch)
+            return y - 0.06*inch
+
+        def yn_row(y, num, text):
+            """YES/NO question row — text wraps within available width."""
+            text_w = cw - 1.05*inch
+            # Draw question text with wrapping
+            c.setFont("Helvetica", 8)
+            question = f"{num}.  {text}"
+            words = question.split()
+            line = ""
+            first_line = True
+            line_y = y
+            for word in words:
+                test = (line + " " + word).strip()
+                if c.stringWidth(test, "Helvetica", 8) > text_w:
+                    c.drawString(ml+0.1*inch, line_y, line)
+                    line_y -= 0.13*inch
+                    line = word
+                    first_line = False
+                else:
+                    line = test
+            if line:
+                c.drawString(ml+0.1*inch, line_y, line)
+                line_y -= 0.13*inch
+            # YES/NO boxes — aligned with first line of question
+            bx = w - mr - 0.90*inch
+            c.setFont("Helvetica-Bold", 8)
+            c.rect(bx, y-0.14*inch, 0.34*inch, 0.16*inch, fill=0, stroke=1)
+            c.drawString(bx+0.04*inch, y-0.11*inch, "YES")
+            c.rect(bx+0.42*inch, y-0.14*inch, 0.30*inch, 0.16*inch, fill=0, stroke=1)
+            c.drawString(bx+0.46*inch, y-0.11*inch, "NO")
+            return line_y - 0.08*inch
+
+        # ══════════════════════════════════════════════
+        # PAGE 1
+        # ══════════════════════════════════════════════
+        y = h - 0.40*inch
+
+        # Top note
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#444444"))
+        c.drawString(ml, y, "This form is available electronically.  (See Page 2 for Privacy Act and Paperwork Reduction Act Statements)")
+        c.setFillColor(colors.black)
+        y -= 0.14*inch
+
+        # Header
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "AD-1026")
+        c.drawString(ml + 0.9*inch, y, "U.S. DEPARTMENT OF AGRICULTURE")
+        c.setFont("Helvetica", 8)
+        c.drawString(ml, y-0.14*inch, "(10-30-14)")
+        c.drawString(ml + 0.9*inch, y-0.14*inch, "Farm Service Agency")
+        y -= 0.26*inch
+
+        c.setFont("Helvetica-Bold", 11)
+        c.drawCentredString(w/2, y, "HIGHLY ERODIBLE LAND CONSERVATION (HELC) AND")
+        y -= 0.18*inch
+        c.drawCentredString(w/2, y, "WETLAND CONSERVATION (WC) CERTIFICATION")
+        y -= 0.12*inch
+        c.setFont("Helvetica-Oblique", 8)
+        c.drawCentredString(w/2, y, "Read attached AD-1026 Appendix before completing form.")
+        y -= 0.14*inch
+        hline(y, 1.0)
+        y -= 0.12*inch
+
+        # Simple pre-fill note — no banner
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#444444"))
+        c.drawString(ml, y,
+            f"Pre-filled fields: Crop Year ({crop_year}), County ({county}), State ({state_name}), Land Use ({land_use})")
+        c.setFillColor(colors.black)
+        y -= 0.14*inch
+
+        # ── PART A ──────────────────────────────────
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "PART A – BASIC INFORMATION")
+        y -= 0.12*inch
+
+        gap = 0.03*inch
+        bh = 0.36*inch
+        w1=cw*0.50; w2=cw*0.25; w3=cw*0.21
+        x1=ml; x2=x1+w1+gap; x3=x2+w2+gap
+        field_box(x1, y, w1, bh, "1. Name of Producer", "")
+        field_box(x2, y, w2, bh, "2. Tax ID (Last 4 digits)", "")
+        field_box(x3, y, w3, bh, "3. Crop Year", crop_year, filled=False)
+        y -= bh + 0.02*inch
+
+        field_box(ml, y, cw, bh, '4. Names of affiliated persons with farming interests. Enter "None," if applicable.', "")
+        y -= bh + 0.06*inch
+
+        c.setFont("Helvetica", 8)
+        c.drawString(ml+0.05*inch, y,
+            "5. Check one of these boxes if the statement applies; otherwise continue to Part B.")
+        y -= 0.12*inch
+
+        y = checkbox_wrap(ml+0.15*inch, y,
+            "A. The producer in Part A does not have interest in land devoted to agriculture. Examples include "
+            "bee keepers who place their hives on another person's land, producers of crops grown in greenhouses, "
+            "and producers of aquaculture AND these producers do not own/lease any agricultural land themselves. "
+            "Note: Do not check this box if the producer shares in a crop.")
+
+        y = checkbox_wrap(ml+0.15*inch, y,
+            "B. The producer in Part A meets all three of the following: does not participate in any USDA program "
+            "that is subject to HELC and WC compliance except Federal Crop Insurance; only has interest in land "
+            "devoted to agriculture which is exclusively used for perennial crops, except sugarcane; and has not "
+            "converted a wetland after February 7, 2014.")
+
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#555555"))
+        y = wrap_text(
+            'Note: If either box is checked, and the producer does not participate in FSA or NRCS programs, '
+            'the full tax identification number must be provided. Go to Part D and sign and date.',
+            ml+0.15*inch, y, cw-0.2*inch, "Helvetica-Oblique", 7.5, 0.12*inch)
+        c.setFillColor(colors.black)
+        y -= 0.08*inch
+        hline(y)
+        y -= 0.12*inch
+
+        # ── PART B ──────────────────────────────────
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "PART B - HELC/WC COMPLIANCE QUESTIONS")
+        y -= 0.10*inch
+        c.setFont("Helvetica", 8)
+        y = wrap_text(
+            "Indicate YES or NO to each question. If you are unsure of whether a HEL determination, wetland "
+            "determination, or NRCS evaluation has been completed, contact your local USDA Service Center.",
+            ml+0.05*inch, y, cw, "Helvetica", 8, 0.13*inch)
+
+        bx_hdr = w - mr - 0.90*inch
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(bx_hdr, y, "YES  NO")
+        y -= 0.13*inch
+
+        y = yn_row(y, "6",
+            "During the crop year entered in Part A or the term of a requested USDA loan, did or will the "
+            "producer in Part A plant or produce an agricultural commodity (including sugarcane) on land for "
+            "which an HEL determination has not been made?")
+
+        y = yn_row(y, "7",
+            "Has anyone performed (since December 23, 1985), or will anyone perform any activities to:")
+
+        y = yn_row(y, "   7A",
+            'Create new drainage systems, conduct land leveling, filling, dredging, land clearing, or excavation '
+            'that has NOT been evaluated by NRCS? If "YES", indicate the year(s): _______')
+
+        y = yn_row(y, "   7B",
+            'Improve or modify an existing drainage system that has NOT been evaluated by NRCS? '
+            'If "YES", indicate the year(s): _______')
+
+        y = yn_row(y, "   7C",
+            'Maintain an existing drainage system that has NOT been evaluated by NRCS? '
+            'If "YES", indicate the year(s): _______')
+
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.setFillColor(colors.HexColor("#555555"))
+        y = wrap_text(
+            'Note: If "YES" is checked for Item 7A or 7B, then Part C must be completed. '
+            'If "YES" is checked for Item 7C, NRCS does not have to conduct a certified wetland determination.',
+            ml+0.15*inch, y, cw-0.2*inch, "Helvetica-Oblique", 7.5, 0.12*inch)
+        c.setFillColor(colors.black)
+        y -= 0.06*inch
+
+        c.setFont("Helvetica", 8)
+        c.drawString(ml+0.05*inch, y,
+            "8. Check one or both boxes, if applicable; otherwise, continue to Part C or D.")
+        y -= 0.15*inch
+
+        y = checkbox_wrap(ml+0.15*inch, y,
+            "A. Check this box only if the producer in Part A has FCIC reinsured crop insurance and filing "
+            "this form represents the first time the producer in Part A, including any affiliated person, "
+            "has been subject to HELC and WC provisions.")
+
+        y = checkbox_wrap(ml+0.15*inch, y,
+            "B. Check this box if producer is a tenant whose landlord refuses compliance, or a landlord whose "
+            "tenant is in violation — but all other farms not associated with that party are in compliance. "
+            "(AD-1026B or AD-1026C must be completed.)")
+        hline(y)
+        y -= 0.12*inch
+
+        # ── PART C ──────────────────────────────────
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "PART C – ADDITIONAL INFORMATION")
+        y -= 0.10*inch
+        c.setFont("Helvetica", 8)
+        c.drawString(ml+0.05*inch, y,
+            '9. If "YES" was checked in Item 6 or 7, provide the following information:')
+        y -= 0.16*inch
+
+        bh2 = 0.36*inch
+        wa=cw*0.20; wb=cw*0.28; wcc=cw*0.26; wd=cw*0.22
+        xa=ml; xb=xa+wa+gap; xcc=xb+wb+gap; xd=xcc+wcc+gap
+        field_box(xa, y, wa, bh2, "9A. Farm/Tract/Field No.", "")
+        field_box(xb, y, wb, bh2, "9B. Activity:", "")
+        field_box(xcc, y, wcc, bh2, "9C. Current land use (specify crops):",
+                  land_use[:28] if land_use else "", filled=False)
+        field_box(xd, y, wd, bh2, "9D. County:", county, filled=False)
+        y -= bh2 + 0.08*inch
+        hline(y)
+        y -= 0.10*inch
+
+        # ── PART D ──────────────────────────────────
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "PART D – CERTIFICATION OF COMPLIANCE")
+        y -= 0.10*inch
+
+        cert = (
+            "I have received and read the AD-1026 Appendix and understand and agree to the terms and conditions "
+            "therein on all land in which I (or the producer in Part A if different) and any affiliated person "
+            "have or will have an interest. I understand that eligibility for certain USDA program benefits is "
+            "contingent upon this certification of compliance with HELC and WC provisions and I am responsible "
+            "for any non-compliance. I understand and agree that this certification of compliance is considered "
+            "continuous and will remain in effect unless revoked or a violation is determined. I further "
+            "understand and agree that:"
+        )
+        y = wrap_text(cert, ml+0.05*inch, y, cw, "Helvetica", 7.5, 0.13*inch)
+        y -= 0.05*inch
+
+        for b in [
+            "all applicable payments must be refunded if a determination of ineligibility is made for a violation of HELC or WC provisions.",
+            "NRCS may verify whether a HELC violation or WC has occurred.",
+            "a revised Form AD-1026 must be filed if there are any operation changes or activities that may affect compliance.",
+            "affiliated persons are also subject to compliance with HELC and WC provisions.",
+        ]:
+            y = wrap_text(f"\u25cf  {b}", ml+0.2*inch, y, cw-0.25*inch, "Helvetica", 7.5, 0.13*inch)
+
+        y -= 0.05*inch
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(ml+0.05*inch, y, "Producer's Certification:")
+        y -= 0.13*inch
+        c.setFont("Helvetica-Oblique", 7.5)
+        c.drawString(ml+0.05*inch, y,
+            "I hereby certify that the information on this form is true and correct to the best of my knowledge.")
+        y -= 0.16*inch
+
+        bh3 = 0.40*inch
+        ws1=cw*0.42; ws2=cw*0.24; ws3=cw*0.30
+        xs1=ml; xs2=xs1+ws1+gap; xs3=xs2+ws2+gap
+        field_box(xs1, y, ws1, bh3, "10A. Producer's Signature (By)", "")
+        field_box(xs2, y, ws2, bh3, "10B. Title/Relationship", "")
+        field_box(xs3, y, ws3, bh3, "10C. Date (MM-DD-YYYY)", "")
+        y -= bh3 + 0.06*inch
+
+        # FSA Use Only
+        fsa_h = 0.42*inch
+        c.setFillColor(colors.HexColor("#F0F0F0"))
+        c.rect(ml, y-fsa_h, cw, fsa_h, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(ml+0.1*inch, y-0.13*inch, "FOR FSA USE ONLY (for referral to NRCS)")
+        c.setFont("Helvetica", 7.5)
+        c.drawString(ml+0.1*inch, y-0.25*inch, "Sign and date if NRCS determination is needed.")
+        c.drawString(ml+0.1*inch, y-0.37*inch,
+            "11A. Signature of FSA Representative: ___________________________     11B. Date: ____________")
+        y -= fsa_h + 0.12*inch  # clear gap below FSA box before IMPORTANT
+
+        # Important Notice — all on same indent level
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(ml, y, "IMPORTANT:")
+        c.setFont("Helvetica", 7.5)
+        y = wrap_text(
+            "If you are unsure about the applicability of HELC and WC provisions to your land, contact your "
+            "local USDA Service Center for details concerning the location of any highly erodible land or "
+            "wetland and any restrictions applying to your land according to NRCS determinations before "
+            "planting an agricultural commodity or performing any drainage or manipulation.",
+            ml + 0.82*inch, y, cw - 0.82*inch, "Helvetica", 7.5, 0.12*inch)
+        y -= 0.08*inch
+
+        # Screening data box — plain black, no color, facts only
+        if ei_max is not None:
+            box_h = 0.24*inch
+            c.setFillColor(colors.white)
+            c.rect(ml, y-box_h, cw, box_h, fill=1, stroke=1)
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 7.5)
+            c.drawString(ml+0.12*inch, y-0.09*inch,
+                f"HEL Screening:  EI = {ei_max:.2f}  |  HEL: {'Yes' if hel_present else 'No'}  |  "
+                f"Wetland Indicators: {'Present' if wetland_present else 'Not Detected'}  |  "
+                f"County: {county}  |  Crop Year: {crop_year}")
+            y -= box_h
+
+        # ══════════════════════════════════════════════
+        # PAGE 2
+        # ══════════════════════════════════════════════
+        c.showPage()
+        y = h - 0.5*inch
+
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(ml, y, "AD-1026 (10-30-14)")
+        c.drawString(ml + 1.5*inch, y, "Page 2 of 2")
+        y -= 0.20*inch
+        hline(y, 1.0)
+        y -= 0.18*inch
+
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(ml, y, "Privacy Act and Paperwork Reduction Act Statement")
+        y -= 0.16*inch
+
+        for para in [
+            ("NOTE: The following statement is made in accordance with the Privacy Act of 1974 (5 USC 552a - as amended). "
+             "The authority for requesting the information identified on this form is 7 CFR Part 12, the Food Security Act of 1985 "
+             "(Pub. L. 99-198), and the Agricultural Act of 2014 (Pub. L. 113-79). The information will be used to certify "
+             "compliance with HELC and WC provisions and to determine producer eligibility to participate in and receive benefits "
+             "under programs administered by USDA agencies. The information collected on this form may be disclosed to other "
+             "Federal, State, Local government agencies, Tribal agencies, and nongovernmental entities that have been authorized "
+             "access to the information by statute or regulation and/or as described in applicable Routine Uses identified in the "
+             "System of Records Notice for USDA/FSA-2, Farm Records File (Automated) and USDA/FSA-14, Applicant/Borrower. "
+             "Providing the requested information is voluntary. However, failure to furnish the requested information will result "
+             "in a determination of producer ineligibility to participate in and receive benefits under programs administered by USDA agencies."),
+            ("This information collection is exempted from the Paperwork Reduction Act as specified in the Agricultural Act of 2014 "
+             "(Pub. L. 113-79, Title II, Subtitle G, Funding and Administration). The provisions of appropriate criminal and civil "
+             "fraud, privacy, and other statutes may be applicable to the information provided."),
+        ]:
+            y = wrap_text(para, ml, y, cw, "Helvetica", 8, 0.13*inch)
+            y -= 0.10*inch
+
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(ml, y, "RETURN THIS COMPLETED FORM AD-1026 TO YOUR COUNTY FARM SERVICE AGENCY (FSA) OFFICE.")
+        y -= 0.20*inch
+        hline(y)
+        y -= 0.16*inch
+
+        for para in [
+            ("In accordance with Federal civil rights law and U.S. Department of Agriculture (USDA) civil rights regulations and "
+             "policies, the USDA, its Agencies, offices, and employees, and institutions participating in or administering USDA "
+             "programs are prohibited from discriminating based on race, color, national origin, religion, sex, disability, age, "
+             "marital status, family/parental status, income derived from a public assistance program, political beliefs, or "
+             "reprisal or retaliation for prior civil rights activity, in any program or activity conducted or funded by USDA "
+             "(not all bases apply to all programs). Remedies and complaint filing deadlines vary by program or incident."),
+            ("Persons with disabilities who require alternative means of communication for program information (e.g., Braille, "
+             "large print, audiotape, American Sign Language, etc.) should contact the State or local Agency that administers "
+             "the program or contact USDA through the Telecommunications Relay Service at 711 (voice and TTY). Additionally, "
+             "program information may be made available in languages other than English."),
+            ("To file a program discrimination complaint, complete the USDA Program Discrimination Complaint Form, AD-3027, "
+             "found online at How to File a Program Discrimination Complaint and at any USDA office or write a letter addressed "
+             "to USDA and provide in the letter all of the information requested in the form. To request a copy of the complaint "
+             "form, call (866) 632-9992. Submit your completed form or letter to USDA by: (1) mail: U.S. Department of "
+             "Agriculture, Office of the Assistant Secretary for Civil Rights, 1400 Independence Avenue, SW, Mail Stop 9410, "
+             "Washington, D.C. 20250-9410; (2) fax: (202) 690-7442; or (3) email: program.intake@usda.gov."),
+        ]:
+            y = wrap_text(para, ml, y, cw, "Helvetica", 8, 0.13*inch)
+            y -= 0.10*inch
+
+        c.setFont("Helvetica-Bold", 8)
+        c.drawCentredString(w/2, y, "USDA is an equal opportunity provider, employer, and lender.")
+
+        c.save()
+        pdf_buffer.seek(0)
+        return pdf_buffer.getvalue()
+
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -1611,15 +2310,61 @@ def show_farmer_view(analysis_results, r_val, state_label, ls_factor=None, ls_so
 
         # 4️⃣ SOIL SUMMARY
         st.markdown("**🌾 Your Soil Summary:**")
-        col_soil1, col_soil2 = st.columns(2)
+
+        # Field area from SSURGO or polygon calculation
+        polygon_acres  = st.session_state.get("polygon_acres", None)
+        muname_acres   = st.session_state.get("muname_acres", {})
+        if muname_acres:
+            field_area = sum(muname_acres.values())
+            area_source = "SSURGO"
+        elif polygon_acres:
+            field_area = polygon_acres
+            area_source = "Estimated"
+        else:
+            field_area = None
+            area_source = ""
+
+        col_soil0, col_soil1, col_soil2 = st.columns(3)
+
+        with col_soil0:
+            if field_area:
+                area_display = f"{field_area:,.1f} acres"
+                src_label = area_source
+            else:
+                area_display = "—"
+                src_label = "Draw polygon to calculate"
+            st.markdown(
+                f'''<div style="border:1px solid #333; border-radius:8px; padding:20px; text-align:center; background:#1a1a1a;">
+                <p style="margin:0; font-size:14px; color:#999;">📐 Field Area</p>
+                <p style="margin:10px 0; font-size:28px; font-weight:bold; color:#fff;">{area_display}</p>
+                <p style="margin:0; font-size:12px; color:#64B5F6;">{src_label}</p>
+                </div>''',
+                unsafe_allow_html=True
+            )
 
         problem_soils = (df["EI"] >= 8.0).sum()
         with col_soil1:
-            st.metric("High-Risk Soil Types", problem_soils, help="Soils with EI ≥ 8.0")
+            st.markdown(
+                f'''<div style="border:1px solid #333; border-radius:8px; padding:20px; text-align:center; background:#1a1a1a;">
+                <p style="margin:0; font-size:14px; color:#999;">High-Risk Soils</p>
+                <p style="margin:10px 0; font-size:28px; font-weight:bold; color:#fff;">{problem_soils}</p>
+                <p style="margin:0; font-size:12px; color:#64B5F6;">Soil types with EI ≥ 8.0</p>
+                </div>''',
+                unsafe_allow_html=True
+            )
 
         hydric_count = (df["Hydric"] == "Yes").sum()
+        hydric_val   = "Yes" if hydric_count > 0 else "No"
+        hydric_color = "#4CAF50" if hydric_count > 0 else "#999"
         with col_soil2:
-            st.metric("Hydric Soils Found", "Yes" if hydric_count > 0 else "No", help="Wet/wetland soils on your field")
+            st.markdown(
+                f'''<div style="border:1px solid #333; border-radius:8px; padding:20px; text-align:center; background:#1a1a1a;">
+                <p style="margin:0; font-size:14px; color:#999;">Hydric Soils</p>
+                <p style="margin:10px 0; font-size:28px; font-weight:bold; color:#fff;">{hydric_val}</p>
+                <p style="margin:0; font-size:12px; color:{hydric_color};">Wet/wetland soils present</p>
+                </div>''',
+                unsafe_allow_html=True
+            )
 
         st.markdown("---")
 
@@ -1670,19 +2415,61 @@ def show_farmer_view(analysis_results, r_val, state_label, ls_factor=None, ls_so
         '<div style="background:#FFF3E0;border-left:4px solid #E65100;padding:15px;border-radius:4px;margin-bottom:15px;">'
         '<h3 style="color:#E65100;margin:0;">📞 What Happens Next?</h3>'
         '<ol style="margin:10px 0 0 0;color:#333;">'
-        '<li>Save this result or print it</li>'
-        '<li>Contact your local NRCS office for a formal determination</li>'
-        '<li>An NRCS conservationist will visit your field and verify the results</li>'
-        '<li>If eligible, discuss CRP enrollment options</li>'
+        '<li>Download your pre-filled AD-1026 form below</li>'
+        '<li>Fill in your name, tax ID, and answer the Yes/No questions</li>'
+        '<li>Take it to your local FSA office to file</li>'
+        '<li>FSA will refer to NRCS for an official HEL determination</li>'
         '</ol>'
         '</div>',
         unsafe_allow_html=True
     )
 
-    # Find NRCS Office Button
+    # Buttons row
     st.markdown("---")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
+
     with col1:
+        # AD-1026 download
+        county    = st.session_state.get("detected_county", "")
+        state_nm  = st.session_state.get("detected_state", "")
+        assessment = st.session_state.get("wetland_assessment")
+        wetland_present = bool(assessment and assessment.get("wetland_signal") in ["Strong", "Possible"]) if assessment else hydric_detected
+
+        # Get land use from NLCD if available
+        land_use = ""
+        if assessment and isinstance(assessment, dict):
+            veg = assessment.get("vegetation", {})
+            if isinstance(veg, dict):
+                land_use = veg.get("class_name", "")
+
+        ei_max_val = df["EI"].max() if df is not None and not df.empty and "EI" in df.columns else None
+
+        try:
+            ad1026_pdf = generate_ad1026_pdf(
+                county=county,
+                state_name=state_nm,
+                land_use=land_use,
+                ei_max=ei_max_val,
+                hel_present=bool(ei_max_val and ei_max_val >= 8.0),
+                wetland_present=wetland_present
+            )
+        except Exception as e:
+            ad1026_pdf = None
+            st.error(f"AD-1026 error: {e}")
+
+        if ad1026_pdf:
+            st.download_button(
+                label="📋 Download AD-1026 (FSA Form)",
+                data=ad1026_pdf,
+                file_name=f"AD-1026_HELC_WC_Certification_{datetime.now().strftime('%Y%m%d')}.pdf",
+                mime="application/pdf",
+                key="download_ad1026",
+                help="Pre-filled FSA compliance certification form — take to your local FSA office"
+            )
+        else:
+            st.warning("⚠️ AD-1026 could not be generated. Check terminal for errors.")
+
+    with col2:
         if st.button("🔍 Find NRCS Office Near Me", key="find_nrcs_farmer"):
             st.warning(
                 "⏳ **NRCS Office Locator coming soon!**\n\n"
@@ -1690,7 +2477,7 @@ def show_farmer_view(analysis_results, r_val, state_label, ls_factor=None, ls_so
                 "We're working on integrating this directly into the tool."
             )
 
-    with col2:
+    with col3:
         if st.button("📋 Print Results", key="print_farmer"):
             st.info("Use your browser's print function (Ctrl+P or Cmd+P) to save this page as PDF.")
 
@@ -1837,6 +2624,29 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
             # Note: Detailed soil component analysis is in the Components tab
             st.info("📋 **Detailed soil component data** (with HEL status per soil) is available in the **Components** tab")
 
+            # Field area metric (v17)
+            muname_acres_c  = st.session_state.get("muname_acres", {})
+            polygon_acres_c = st.session_state.get("polygon_acres", None)
+            if muname_acres_c:
+                field_area_c   = sum(muname_acres_c.values())
+                area_source_c  = "SSURGO intersection"
+            elif polygon_acres_c:
+                field_area_c   = polygon_acres_c
+                area_source_c  = "Polygon estimate"
+            else:
+                field_area_c   = None
+                area_source_c  = ""
+
+            if field_area_c:
+                st.markdown(
+                    f'''<div style="border:1px solid #444; border-radius:8px; padding:12px 10px; background:#1a1a1a; display:inline-block; min-width:160px;">
+                    <p style="margin:0; font-size:12px; color:#999;">📐 Total Field Area</p>
+                    <p style="margin:4px 0 2px 0; font-size:18px; font-weight:bold; color:#fff;">{field_area_c:,.1f} acres</p>
+                    <p style="margin:0; font-size:10px; color:#666;">{area_source_c}</p>
+                    </div>''',
+                    unsafe_allow_html=True
+                )
+
     with tab2:
         st.subheader("Field Verification (Optional)")
         st.info("🌾 Enter field-measured slope data to verify/refine the automated results. Updates in real-time! ⚡")
@@ -1929,21 +2739,40 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
     with tab3:
         st.subheader("Soil Components")
         if df is not None and not df.empty:
-            # Add HEL/PHEL status column per soil type
             display_df = df.copy()
 
-            # Calculate HEL/PHEL status for each soil based on its EI
+            # HEL/PHEL status per soil
             display_df["HEL Status"] = display_df["EI"].apply(
                 lambda ei: "✅ HEL" if ei >= 8.0 else "❌ NOT HEL"
             )
 
-            # Select columns for display: Soil Type, Slope, K-Fact, T-Fact, EI, HEL Status, Hydric
-            cols_to_show = ["Soil Type", "Slope", "K-Fact", "T-Fact", "EI", "HEL Status", "Hydric", "Drainage"]
+            # Add Acres column from SSURGO intersection (v17)
+            muname_acres  = st.session_state.get("muname_acres", {})
+            polygon_acres = st.session_state.get("polygon_acres", None)
+            num_rows      = len(display_df)
+
+            def lookup_acres(soil_name):
+                if muname_acres:
+                    total = sum(
+                        ac for muname, ac in muname_acres.items()
+                        if muname.lower().startswith(soil_name.lower())
+                    )
+                    return round(total, 1) if total > 0 else None
+                elif polygon_acres:
+                    return round(polygon_acres / num_rows, 1)
+                return None
+
+            display_df["Acres"] = display_df["Soil Type"].apply(lookup_acres)
+            acres_source = "SSURGO intersection" if muname_acres else (
+                "Polygon ÷ components" if polygon_acres else "Draw polygon to calculate"
+            )
+            st.caption(f"📐 Acreage method: {acres_source}")
+
+            cols_to_show = ["Soil Type", "Acres", "Slope", "K-Fact", "T-Fact", "EI", "HEL Status", "Hydric", "Drainage"]
             display_df = display_df[[col for col in cols_to_show if col in display_df.columns]]
 
             st.dataframe(display_df, use_container_width=True)
 
-            # Summary info
             hel_soils = display_df[display_df["HEL Status"] == "✅ HEL"]["Soil Type"].tolist()
             if hel_soils:
                 st.info(f"🚨 **Problem Soils (HEL):** {', '.join(hel_soils)}")
@@ -1989,17 +2818,27 @@ def show_conservationist_view(analysis_results, r_val, state_label, ls_factor=No
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                # Get coordinates from session state
-                center_lat = st.session_state.get("center_lat", 0)
-                center_lon = st.session_state.get("center_lon", 0)
-
-                # Generate NRCS-CPA-026 PDF
-                pdf_data = generate_cpa026_pdf(r_val, state_label, ls_factor, ls_source, df, ei_max, ei_min, center_lat, center_lon)
+                # Generate NRCS-CPA-026e PDF (v17)
+                center_lat   = st.session_state.get("center_lat", 0)
+                center_lon   = st.session_state.get("center_lon", 0)
+                polygon_acres = st.session_state.get("polygon_acres", None)
+                muname_acres  = st.session_state.get("muname_acres", {})
+                # Get county/state from reverse geocoding cache if available
+                detected_county = st.session_state.get("detected_county", "")
+                detected_state  = st.session_state.get("detected_state", "")
+                pdf_data = generate_cpa026_pdf(
+                    r_val, state_label, ls_factor, ls_source,
+                    df, ei_max, ei_min, center_lat, center_lon,
+                    county=detected_county,
+                    state_name=detected_state,
+                    polygon_acres=polygon_acres,
+                    muname_acres=muname_acres
+                )
                 if pdf_data:
                     st.download_button(
-                        label="📄 NRCS-CPA-026 PDF",
+                        label="📄 NRCS-CPA-026e PDF",
                         data=pdf_data,
-                        file_name=f"NRCS-CPA-026_HEL_Determination_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        file_name=f"NRCS-CPA-026e_HEL_Determination_{datetime.now().strftime('%Y%m%d')}.pdf",
                         mime="application/pdf",
                         key="download_cpa026_pdf"
                     )
@@ -2153,6 +2992,26 @@ with col_map:
             st.session_state["center_lon"]        = c_lon
             # Store bounds for wetland assessment (drawn polygon bounds)
             st.session_state["drawn_bounds"]      = [min(lats), min(lons), max(lats), max(lons)]
+            # Calculate total polygon area — fallback (v17)
+            acres_val, _ = calculate_polygon_acres(coords)
+            st.session_state["polygon_acres"]     = acres_val
+            # Per-soil-unit acres via SSURGO intersection — NRCS method (v17)
+            muname_acres, acres_err = calculate_ssurgo_acres_per_mukey(drawn_wkt)
+            st.session_state["muname_acres"]      = muname_acres
+            if acres_err:
+                st.session_state["muname_acres_err"] = acres_err
+            # Cache county + state from reverse geocoding for PDF (v17)
+            try:
+                _geo_url = f"https://nominatim.openstreetmap.org/reverse?lat={c_lat}&lon={c_lon}&format=json&zoom=10"
+                _geo_r   = requests.get(_geo_url, headers={"User-Agent": "CRP_Conservation_Tool_v17_NRCS"}, timeout=5)
+                _geo_addr = _geo_r.json().get("address", {})
+                st.session_state["detected_county"] = (
+                    _geo_addr.get("county","").replace(" County","").strip()
+                )
+                st.session_state["detected_state"]  = _geo_addr.get("state", "")
+            except Exception:
+                st.session_state["detected_county"] = ""
+                st.session_state["detected_state"]  = ""
             # R-factor priority chain: Raster → NOAA CDO → State FOTG → National Default
             if RASTERIO_AVAILABLE and not RFACTOR_RASTER_LOCAL_PATH.exists():
                 st.info("⏳ Loading R-factor raster for the first time (~30s one-time download)...")
@@ -2219,7 +3078,8 @@ with col_res:
                     <li><strong>Draw Polygon on Map</strong> — Draw your field boundary on the map (⚡ auto-analyzes instantly)</li>
                     <li><strong>OR Enter Coordinates</strong> — Use the sidebar to enter lat/lon values, then click <strong>"🚀 Analyze"</strong></li>
                     <li><strong>View Results</strong> — Get your HEL eligibility status (✅ HEL, ⚠️ PHEL, or ❌ NOT HEL)</li>
-                    <li><strong>Contact NRCS</strong> — Find your local office for official determination</li>
+                    <li><strong>Download AD-1026 Form</strong> — Get your pre-filled FSA compliance form (📋 in Farmer Mode) and take it to your local FSA office</li>
+                    <li><strong>Contact NRCS</strong> — FSA will refer to NRCS for an official HEL determination</li>
                 </ol>
 
                 <h4 style="color:#1565C0;">💡 Try an Example:</h4>
