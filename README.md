@@ -23,7 +23,7 @@ This tool provides **preliminary HEL and wetland screening** using official NRCS
 - Prioritize which fields to submit to CRP
 - Generate baseline data for NRCS verification
 
-**Status:** 🟢 **USGS 3DEP DEM Integration Live** — LS factor now calculated from real USGS 3DEP 30m elevation data (true L × S formula, ±5% error). Actively seeking feedback from NRCS conservationists and farmers to validate methodology and recommendations before formal deployment.
+**Status:** 🟢 **v18 (May 26, 2026)** — Core HEL/PHEL determination ✅ (~83% complete). Two operating modes live (Farmer Mode for quick screening, Conservationist Mode for technical detail). Official NRCS-CPA-026e and AD-1026 forms auto-fill ready. Acreage calculation validated at 909.4 acres against real SSURGO data. See **[Master Reference Guide](CRP_HEL_Tool_Master_Reference.pdf)** for comprehensive documentation.
 
 ---
 
@@ -36,16 +36,75 @@ This tool provides **preliminary HEL and wetland screening** using official NRCS
 
 ---
 
+## Two Operating Modes
+
+### 🚜 Farmer Mode
+**For:** Farmers, landowners, FSA agents
+
+**Features:**
+- Simple traffic-light wetland signal (Strong / Possible / Unlikely)
+- Plain-English HEL result: "Likely HEL" or "Not Likely HEL"
+- Total field acreage
+- Dominant soil types summary card
+- **Download AD-1026 FSA compliance certification form** (pre-filled, ready for signature)
+
+### 🔬 Conservationist Mode
+**For:** NRCS conservationists, agronomists, field technicians
+
+**Features (5 tabs):**
+- **Tab 1 — HEL Summary:** Full RUSLE2 parameters (R, K, LS, T, EI) per soil component; HEL/PHEL/NOT HEL status with EI min/max range; A/B/C confidence indicator
+- **Tab 2 — Wetland Analysis:** Full four-indicator table (hydric soils, vegetation, hydrology, proximity); two-tier signal (Strong = hydric + poor drainage; Possible = hydric only)
+- **Tab 3 — Soil Components:** Detailed table with K-factor, T-factor, slope range, hydric rating, drainage class, acreage per map unit
+- **Tab 4 — NRCS-CPA-026e Form:** **Download official NRCS HEL/Wetland Determination form** (Section I + II pre-filled with RUSLE2 data, county/state auto-filled via reverse geocoding)
+- **Tab 5 — Field Verification:** Manually override R, K, LS, T values and recalculate EI in real time (for on-site adjustments)
+
+---
+
+## Official Forms Auto-Filled
+
+### NRCS-CPA-026e — HEL & Wetland Conservation Determination
+**For:** NRCS conservationists to document field determination
+
+**Auto-filled fields:**
+- County, State (from Nominatim reverse geocoding)
+- Request Date
+- Section I: HEL table (soil name, HEL Y/N, EI value, acres per soil)
+- Section II: Wetland table (indicator results, acres)
+- RUSLE2 parameters (R, K, LS, T, EI)
+- Footer note: acreage method used (SSURGO intersection vs. polygon estimate)
+
+**Requires:** NRCS staff signature and field verification before official submission
+
+### AD-1026 FSA — HELC and Wetland Conservation Certification
+**For:** Farmers to certify compliance with USDA conservation rules
+
+**Auto-filled fields:**
+- Producer information
+- HEL status from tool calculation
+- Wetland status from tool calculation
+- Date
+
+**Requires:** Producer signature; filed with local FSA office
+
+---
+
 ## How It Works
 
 1. **User Input:** Draw a field polygon on the map or enter bounding coordinates
-2. **R-Factor Determination:** State-level average from NRCS FOTG. Falls back to national default (R=100) if state detection fails.
-3. **Soil Data:** Query SSURGO for all soil components intersecting the polygon
-4. **LS Factor:** Fetch real 30m DEM from USGS 3DEP (py3dep). Calculate true LS = L × S using DEM-derived slope steepness (S) and flow-accumulation slope length (L). Falls back to Slope^1.2 × 0.1 if DEM fetch fails.
-5. **HEL Calculation:** Compute Erosion Index (EI) per component using RUSLE2 formula: EI = (R × K × LS) / T
-6. **HEL Determination:** Flag field as likely HEL if EI ≥ 8.0
-7. **Wetland Check:** Check SSURGO hydricrating for wetland-forming potential
-8. **CP Recommendations:** Suggest practice groups (grassland, wildlife, water, wetland) based on EI and hydric status
+2. **R-Factor Determination:** NOAA CONUS 800m raster (±1–3% error) → NOAA CDO API (±5–8%) → State-level FOTG (±20–30%) → National default (R=100, last resort)
+3. **Soil Data:** Query SSURGO for all soil components intersecting the polygon; major components only (majcompflag='yes')
+4. **LS Factor:** Fetch real 30m DEM from USGS 3DEP (py3dep). Calculate true LS = L × S using DEM-derived slope steepness (S) and flow-accumulation slope length (L). Falls back to Slope^1.2 × 0.1 approximation if DEM fetch fails.
+5. **HEL Calculation:** Compute Erosion Index (EI) per soil component using RUSLE2 formula: **EI = (R × K × LS) / T**
+6. **HEL Determination:** 
+   - **HEL:** EI_min ≥ 8.0 (entire field qualifies)
+   - **PHEL:** EI_min < 8.0 AND EI_max ≥ 8.0 (slope range straddles threshold — requires NRCS field visit)
+   - **NOT HEL:** EI_max < 8.0 (does not qualify)
+7. **Acreage Calculation:** SSURGO mupolygon intersection (same method as NRCS GIS tools) → Fallback to polygon ÷ component proportions
+8. **Wetland Indicators:** Four-tier check:
+   - Hydric soils (SSURGO hydricrating)
+   - Hydrophytic vegetation (USGS NLCD 2021)
+   - Wetland hydrology (SSURGO drainage class)
+   - Proximity to water bodies (FWS NWI)
 
 ---
 
@@ -107,27 +166,41 @@ EI = (R × K × LS) / T
 
 ---
 
-## Limitations & Future Enhancements
+## Known Limitations & Remaining Work
 
 ### Current Limitations
-- State-level R-factor averages (±20-30% intra-state variation)
-- Surface horizon only (top soil layer)
-- No land cover type detection
-- No water proximity detection
-- **CP recommendations require expert validation**
+- **C-Factor & P-Factor not implemented** — Formula uses R×K×LS/T; C×P defaults to 1.0 (conservative; overstates EI for screening purposes)
+- **NOAA CDO fallback uses single year (2023)** — Should be 22+ year average; causes ±10–30% variance on fallback path
+- **LS flow accumulation simplified** — Not true D8 algorithm; ±15–40% error on complex terrain. Mitigation: DEM-based primary method is accurate (±5%).
+- **SSURGO surface horizon only** — Top soil layer; deeper horizons not considered
+- **Sodbust Y/N column not auto-populated** — Requires NRCS internal lookup (cannot determine from public data)
 
-### Planned Enhancements
-- Point-specific R-factor via EPA LEW API (reduce error to <5%)
-- Water proximity via NHD/3DHP (activate riparian practices CP21, CP22, CP29)
-- Land cover filtering via NLCD (filter irrelevant practice categories)
-- Expert validation of CP recommendation logic
+### Planned Enhancements (v19+)
+- Multi-year NOAA R-factor averaging (reduce variance to ±5%)
+- Proper D8 flow accumulation algorithm for L-factor
+- C-Factor & P-Factor integration for conservation practice credit calculations
+- NRCS Office locator (currently stub; "coming soon")
+- Unit tests for EI calculation, R-factor lookup, acreage methods
+- Mobile layout optimization
+
+### See Also
+**For comprehensive technical documentation, detailed compliance audit, and validation results**, see **[CRP_HEL_Tool_Master_Reference.pdf](CRP_HEL_Tool_Master_Reference.pdf)** (~18 pages, covers all sections including data sources, fallback mechanisms, regulatory alignment, etc.)
 
 ---
 
-## Files
+## Documentation & Files
 
-- `crp_final_v12.py` — Main application script
+### Core Application
+- `crp_final_v17.py` — Main application script (v17; Streamlit app)
+- `rfactor_calculator.py` — R-factor calculation module
+- `wetland_features.py` — Wetland indicator detection
 - `requirements.txt` — Python dependencies
+
+### Documentation
+- **[CRP_HEL_Tool_Master_Reference.pdf](CRP_HEL_Tool_Master_Reference.pdf)** — Comprehensive 18-page technical reference (formulas, data sources, fallback mechanisms, compliance audit, validation results)
+- **[CRP_HEL_Wetland_Gap_Analysis_v3.md](CRP_HEL_Wetland_Gap_Analysis_v3.md)** — Current feature status & remaining gaps (May 26, 2026, ~83% complete)
+- **[PHASE_3_FORM_ANALYSIS_AND_IMPLEMENTATION.md](PHASE_3_FORM_ANALYSIS_AND_IMPLEMENTATION.md)** — NRCS-CPA-026e and AD-1026 form integration details
+- **[NRCS_COMPLIANCE_VERIFICATION_REPORT.md](NRCS_COMPLIANCE_VERIFICATION_REPORT.md)** — Line-by-line NRCS Part 616 compliance audit
 - `README.md` — This file
 
 ---
@@ -138,8 +211,16 @@ For questions, feedback, or domain expert input on methodology assumptions and C
 
 ---
 
-**⚠️ Disclaimer:**
+**⚠️ Important Disclaimer:**
 
-This is a prototype tool designed for evaluation and feedback by domain experts. Results are indicative only and should not be used as the basis for any CRP application or land management decision without NRCS confirmation.
+This tool provides **preliminary HEL and wetland screening only** using public USDA/NRCS data and open-source methodologies. It is **NOT a substitute for official NRCS HEL determination** (which requires NRCS internal data and field verification).
 
-**Final HEL determination requires official NRCS field verification.**
+**Legal Notice:**
+- Results are for planning and awareness purposes only
+- Cannot replace NRCS Part 616 official determinations
+- Does not access NASIS (NRCS internal frozen soils database)
+- Field verification by NRCS staff is required before CRP application
+- Do not use for regulatory compliance claims without NRCS confirmation
+
+**Data Sources:**
+All data retrieved from official federal APIs (USDA SSURGO, USGS 3DEP, NOAA, NRCS FOTG). See Master Reference Guide for data freshness, accuracy, and fallback mechanisms.
